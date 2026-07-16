@@ -61,13 +61,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-try:
-    from lerobot.teleoperators.teleoperator import Teleoperator, TeleoperatorConfig
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "lerobot is required to use BiQuestTeleoperator. "
-        "Run from a project environment with lerobot installed."
-    ) from e
+# Real LeRobot base classes when lerobot is installed, lightweight
+# stand-ins otherwise (see _compat) — a teleop-only box needs no torch.
+from ._compat import Teleoperator, TeleoperatorConfig
 
 try:
     import websockets

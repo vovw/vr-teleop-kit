@@ -24,13 +24,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-try:
-    from lerobot.teleoperators.teleoperator import Teleoperator, TeleoperatorConfig
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "lerobot is required to use SingleArmQuestTeleoperator."
-    ) from e
-
+# Real LeRobot base classes when lerobot is installed, lightweight
+# stand-ins otherwise (see _compat) — a teleop-only box needs no torch.
+from ._compat import Teleoperator, TeleoperatorConfig
 from .bi_quest_teleop import BiQuestTeleoperator, BiQuestTeleoperatorConfig
 
 

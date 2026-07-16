@@ -46,7 +46,7 @@ from vr_teleop_kit.lerobot.cli import (
     parse_rest_pose_env,
 )
 
-from lerobot.utils.utils import init_logging
+from vr_teleop_kit.lerobot import init_logging
 
 ARM_DOFS = 6
 
