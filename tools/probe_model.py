@@ -1,26 +1,20 @@
-"""Probe the TRLC-DK1 URDF as loaded by mujoco.
+"""Probe the combined YAM arm + gripper model as built for the IK.
 
-Two passes:
-  1. Plain `MjModel.from_xml_path` of the URDF — confirms what mujoco's
-     URDF importer produces (in particular, whether `tool0` survives as
-     its own body — it doesn't, because fixed joints get merged).
-  2. `MjSpec`-based load that re-attaches a `tool0` site to `link6-7`
-     using the offset from the URDF's `gripper_tool0` joint. Sites are
-     preserved by the importer and give us first-class Jacobian access.
+Dumps what `vr_teleop_kit.ik.model.build_model_with_tool0_site` produces —
+the yam.xml arm merged with the linear_4310 gripper (i2rt mount transform
+applied) plus the `tool0` / `j4_anchor` sites the IK pipeline needs — and
+runs FK at a couple of poses so the chain can be eyeballed.
 
-Run:
-    python tools/probe_urdf.py path/to/TRLC-DK1-Follower.urdf
+Run (model resolved like everywhere else: arg > YAM_XML > ./i2rt clone):
+    python tools/probe_model.py [path/to/i2rt/robot_models/arm/yam/yam.xml]
 """
 
 import sys
-from pathlib import Path
 
 import mujoco
 import numpy as np
 
-# URDF gripper_tool0 fixed joint, transcribed from the URDF.
-TOOL0_OFFSET_XYZ = np.array([0.158, 0.0, 0.0])
-TOOL0_OFFSET_RPY = np.array([-np.pi / 2, 0.0, -np.pi / 2])  # roll, pitch, yaw
+from vr_teleop_kit.ik.model import DEFAULT_Q_REST, build_model_with_tool0_site
 
 JOINT_TYPE_NAMES = {
     mujoco.mjtJoint.mjJNT_FREE: "free",
@@ -33,20 +27,6 @@ JOINT_TYPE_NAMES = {
 def name_of(model: mujoco.MjModel, obj_type, idx: int) -> str:
     name = mujoco.mj_id2name(model, obj_type, idx)
     return name if name is not None else f"<unnamed#{idx}>"
-
-
-def rpy_to_wxyz(rpy: np.ndarray) -> np.ndarray:
-    """URDF rpy convention: R = Rz(yaw) · Ry(pitch) · Rx(roll). Returns (w,x,y,z)."""
-    r, p, y = rpy
-    cr, sr = np.cos(r / 2), np.sin(r / 2)
-    cp, sp = np.cos(p / 2), np.sin(p / 2)
-    cy, sy = np.cos(y / 2), np.sin(y / 2)
-    return np.array([
-        cr * cp * cy + sr * sp * sy,
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-    ])
 
 
 def print_model_summary(model: mujoco.MjModel) -> None:
@@ -100,7 +80,7 @@ def fk_dump(model: mujoco.MjModel, data: mujoco.MjData, label: str) -> None:
     print(f"\n=== FK at {label} ===")
     mujoco.mj_forward(model, data)
 
-    bodies = ["world", "link1-2", "link2-3", "link3-4", "link4-5", "link5-6", "link6-7"]
+    bodies = ["world", "link1", "link2", "link3", "link4", "link5", "link6", "gripper"]
     for tname in bodies:
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, tname)
         if bid == -1:
@@ -113,7 +93,7 @@ def fk_dump(model: mujoco.MjModel, data: mujoco.MjData, label: str) -> None:
             f"quat_wxyz=({q[0]:+.4f},{q[1]:+.4f},{q[2]:+.4f},{q[3]:+.4f})"
         )
 
-    for sname in ["tool0"]:
+    for sname in ["tool0", "j4_anchor"]:
         sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, sname)
         if sid == -1:
             continue
@@ -128,53 +108,21 @@ def fk_dump(model: mujoco.MjModel, data: mujoco.MjData, label: str) -> None:
         )
 
 
-def load_with_tool0_site(urdf_path: Path) -> tuple[mujoco.MjModel, mujoco.MjData]:
-    """Load the URDF via MjSpec and add a `tool0` site to `link6-7` reproducing
-    the URDF's `gripper_tool0` fixed-joint offset."""
-    spec = mujoco.MjSpec.from_file(str(urdf_path))
-    parent = spec.body("link6-7")
-    if parent is None:
-        raise RuntimeError("link6-7 not found in spec")
-    parent.add_site(
-        name="tool0",
-        pos=TOOL0_OFFSET_XYZ.tolist(),
-        quat=rpy_to_wxyz(TOOL0_OFFSET_RPY).tolist(),
-    )
-    model = spec.compile()
-    return model, mujoco.MjData(model)
-
-
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {sys.argv[0]} path/to/TRLC-DK1-Follower.urdf")
-    urdf = Path(sys.argv[1]).expanduser()
-    print(f"loading: {urdf}\n")
-    if not urdf.exists():
-        raise SystemExit(f"URDF not found at {urdf}")
+    model_path = sys.argv[1] if len(sys.argv) > 1 else None
+    model, data = build_model_with_tool0_site(model_path)
 
-    print("##########  Pass 1: plain URDF import  ##########\n")
-    model = mujoco.MjModel.from_xml_path(str(urdf))
-    data = mujoco.MjData(model)
     print_model_summary(model)
     print_joints(model)
     print_bodies(model)
     print_sites(model)
+
     data.qpos[:] = 0
     fk_dump(model, data, "qpos = 0")
 
-    print("\n\n##########  Pass 2: MjSpec with re-attached tool0 site  ##########\n")
-    model2, data2 = load_with_tool0_site(urdf)
-    print_model_summary(model2)
-    print_sites(model2)
-    data2.qpos[:] = 0
-    fk_dump(model2, data2, "qpos = 0")
-
-    # Bonus: small custom pose so we can see the chain move.
-    custom = np.zeros(model2.nq)
-    custom[1] = np.pi / 2   # joint2 raise shoulder
-    custom[2] = np.pi / 2   # joint3 elbow
-    data2.qpos[:] = custom
-    fk_dump(model2, data2, "qpos = [0, π/2, π/2, 0, 0, 0, 0, 0]")
+    data.qpos[:] = 0
+    data.qpos[: len(DEFAULT_Q_REST)] = DEFAULT_Q_REST
+    fk_dump(model, data, f"rest pose {np.round(DEFAULT_Q_REST, 3).tolist()}")
 
 
 if __name__ == "__main__":

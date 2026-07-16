@@ -10,8 +10,8 @@ To watch both arms, run two instances:
     uv run python tools/viewer_client.py --arm right &
     uv run python tools/viewer_client.py --arm left
 
-While the relay is running (DK1_URDF must point at the URDF, or pass
---urdf):
+While the relay is running (the YAM model files are found in an ./i2rt
+clone automatically; otherwise set YAM_XML or pass --model):
     python tools/viewer_client.py
     python tools/viewer_client.py --url wss://<lan-ip>:8443/ws --arm left
 
@@ -32,6 +32,7 @@ import os
 import platform
 import shutil
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -54,6 +55,17 @@ def _reexec_under_mjpython_if_needed() -> None:
         )
     env = os.environ.copy()
     env["_MJPYTHON_REEXEC"] = "1"
+    # mjpython embeds CPython by `dlopen`-ing the interpreter binary, then
+    # resolving its `@rpath/libpython*.dylib` dependency. With a uv-managed
+    # venv, `sys.executable` is a *symlink* into ~/.local/share/uv/python/...,
+    # so mjpython searches for libpython next to the symlink (.venv/bin) rather
+    # than the real standalone-Python prefix and dies with a dlopen error.
+    # Point dyld at the directory that actually holds libpython (`sysconfig`
+    # reports the real prefix, following the symlink) so the lookup succeeds.
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if libdir and os.path.isdir(libdir):
+        existing = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = f"{libdir}:{existing}" if existing else libdir
     os.execve(mjpython, [mjpython, *sys.argv], env)
 
 
@@ -130,12 +142,13 @@ def main() -> None:
     ap.add_argument("--from-id", default=None,
                     help="only render ik_state from this teleop id (for running "
                          "several teleops against one relay side by side).")
-    ap.add_argument("--urdf", default=None,
-                    help="path to the DK1 follower URDF (default: DK1_URDF env var).")
+    ap.add_argument("--model", default=None,
+                    help="path to the YAM arm MJCF inside an i2rt clone "
+                         "(default: YAM_XML env var, then ./i2rt auto-detect).")
     args = ap.parse_args()
     qpos_key = f"{args.arm}_qpos"
 
-    model, data = build_model_with_tool0_site(args.urdf)
+    model, data = build_model_with_tool0_site(args.model)
 
     # Start at home pose so the viewer has something to show before any
     # ik_state arrives.

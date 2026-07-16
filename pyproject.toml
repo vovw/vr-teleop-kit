@@ -1,7 +1,7 @@
 [project]
 name = "vr-teleop-kit"
 version = "0.1.0"
-description = "WebXR (Meta Quest) teleoperation kit for robot manipulators: WebSocket relay, clutch-relative pose mapping with reach limits, per-robot IK (TRLC-DK1 included), and a LeRobot Teleoperator adapter"
+description = "WebXR (Meta Quest) teleoperation kit for robot manipulators: WebSocket relay, clutch-relative pose mapping with reach limits, per-robot IK (I2RT YAM included), and a LeRobot Teleoperator adapter"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -22,15 +22,15 @@ relay = [
     "av>=12",
     "opencv-python-headless>=4.10",
 ]
-# The LeRobot Teleoperator adapter (examples additionally need the DK1
-# driver — see the README, it installs from the trlc-dk1 repository).
+# The LeRobot Teleoperator adapter (the hardware example additionally
+# needs the i2rt driver — see the README, it installs from an i2rt clone).
 lerobot = [
     "lerobot",
 ]
 
 [project.urls]
 Repository = "https://github.com/Dream-Machines-Robotics/vr-teleop-kit"
-"DK1 driver + URDF" = "https://github.com/robot-learning-co/trlc-dk1"
+"YAM driver + model files" = "https://github.com/i2rt-robotics/i2rt"
 
 [project.scripts]
 vr-teleop-relay = "vr_teleop_kit.relay.server:main"

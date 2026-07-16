@@ -5,15 +5,16 @@ A kit for teleoperating robot manipulators with a WebXR headset
 browser, streams 6-DoF controller poses over a WebSocket, and a Python
 teleoperator turns them into joint commands via differential inverse
 kinematics (forward kinematics and Jacobians read from a MuJoCo model
-of the arm, built from its URDF). Plugs into [LeRobot](https://github.com/huggingface/lerobot)
+of the arm). Plugs into [LeRobot](https://github.com/huggingface/lerobot)
 as a drop-in `Teleoperator`.
 
 > **Full write-up:** [**VR Teleoperation Stack for Robot Manipulation**](https://aurelarnold.xyz/blog/vr-teleoperation-stack/) walks through the whole stack: the inverse kinematics, the safety features, and the camera and haptic feedback that close the loop.
 
-The robot currently supported end-to-end is the
-[TRLC-DK1](https://www.robot-learning.co) bimanual arm. The pose mapping
-and the relay are robot-agnostic; supporting another arm means porting
-the IK layer (see "Adapting to a different arm" below).
+The robot currently supported end-to-end is a bimanual pair of
+[I2RT YAM](https://i2rt.com) arms (with the linear_4310 gripper),
+driven through [i2rt](https://github.com/i2rt-robotics/i2rt). The pose
+mapping and the relay are robot-agnostic; supporting another arm means
+porting the IK layer (see "Adapting to a different arm" below).
 
 Highlights:
 
@@ -55,8 +56,8 @@ src/vr_teleop_kit/
 ├── core/      robot-agnostic: clutch-relative pose mapping + reach limit
 ├── relay/     robot-agnostic: FastAPI WebSocket relay, WebRTC cameras,
 │              and the WebXR page served to the Quest
-├── ik/        DK1-tuned: decoupled IK (MuJoCo model
-│              built from the DK1 URDF, wrist-anchor geometry, mount frames)
+├── ik/        YAM-tuned: decoupled IK (MuJoCo model built from the i2rt
+│              yam.xml + gripper MJCF, wrist-anchor geometry, mount frames)
 └── lerobot/   thin adapter: LeRobot Teleoperator classes wiring core+ik
                into the LeRobot action interface
 ```
@@ -101,12 +102,14 @@ git clone https://github.com/Dream-Machines-Robotics/vr-teleop-kit
 cd vr-teleop-kit
 pip install -e ".[relay,lerobot]"           # or: uv pip install -e ".[relay,lerobot]"
 
-# DK1 driver (also provides the URDF):
-git clone https://github.com/robot-learning-co/trlc-dk1
-pip install -e ./trlc-dk1
+# YAM model files (and, for real hardware, the driver):
+git clone https://github.com/i2rt-robotics/i2rt
+pip install -e ./i2rt        # only needed to drive real hardware
 
-# Point the IK at the URDF (or pass urdf_path in the teleop config):
-export DK1_URDF=$PWD/trlc-dk1/urdf/follower/TRLC-DK1-Follower.urdf
+# The IK finds the model files in the ./i2rt clone automatically. If the
+# clone lives elsewhere, point at the arm MJCF instead (or pass
+# model_path in the teleop config):
+export YAM_XML=/path/to/i2rt/i2rt/robot_models/arm/yam/yam.xml
 ```
 
 The `relay` extra covers the server (FastAPI, aiortc, OpenCV); the
@@ -162,7 +165,7 @@ are on the same page and apply live.
 
 ```bash
 vr-teleop-relay                       # terminal 1
-python tools/viewer_client.py         # terminal 2: MuJoCo viewer (uses DK1_URDF)
+python tools/viewer_client.py         # terminal 2: MuJoCo viewer (YAM model)
 python examples/pure_sim.py           # terminal 3: IK loop, no hardware
 # Quest browser → Start Teleop → squeeze a grip
 ```
@@ -176,23 +179,22 @@ above, not just the bare package.)
 
 ## Use as a LeRobot Teleoperator
 
-The adapter emits the exact action dict the DK1 followers expect
-(`{left,right}_joint_{1..6}.pos`, `{left,right}_gripper.pos`), so it
-pairs with an unmodified `BiDK1Follower`. Nothing is copied into
-LeRobot's tree; you instantiate and hand it to your loop:
+The adapter emits a bimanual joint action dict
+(`{left,right}_joint_{1..6}.pos`, `{left,right}_gripper.pos`; gripper
+0 = open, 1 = closed), so it pairs with any follower using that schema.
+Nothing is copied into LeRobot's tree; you instantiate and hand it to
+your loop:
 
 ```python
 import time
 
 from vr_teleop_kit.lerobot import BiQuestTeleoperator, BiQuestTeleoperatorConfig
-from lerobot_robot_trlc_dk1.bi_follower import BiDK1Follower, BiDK1FollowerConfig
 
 teleop = BiQuestTeleoperator(BiQuestTeleoperatorConfig(
     id="vr-teleop",
     ws_url="ws://127.0.0.1:8443/ws",
-    urdf_path="/path/to/TRLC-DK1-Follower.urdf",   # or set DK1_URDF
+    model_path="/path/to/i2rt/.../arm/yam/yam.xml",  # or set YAM_XML / rely on ./i2rt
 ))
-follower = BiDK1Follower(BiDK1FollowerConfig(left_arm_port=..., right_arm_port=...))
 
 teleop.connect(); follower.connect()
 while True:
@@ -200,8 +202,11 @@ while True:
     time.sleep(1 / 200)
 ```
 
-`examples/teleop_bi_dk1.py` is the complete version of this loop (rest
-ramp, haptic feedback, timing). For LeRobot CLIs, import
+`examples/teleop_bi_yam.py` is the complete hardware version of this
+loop: it drives two i2rt YAMs (one CAN channel per arm) directly via
+`get_yam_robot`, with the rest ramp, gripper-convention conversion
+(i2rt's normalized gripper is 0 = closed, 1 = open — the inverse of the
+teleop's), haptic feedback, and timing. For LeRobot CLIs, import
 `vr_teleop_kit.lerobot` so the `@register_subclass` decorators run, then
 use `--teleop.type=bi_quest_teleop` (bimanual) or
 `single_arm_quest_teleop` (one arm, unprefixed action keys).
@@ -223,33 +228,20 @@ This step is optional: the teleop feature-detects the method via `getattr`
 and degrades gracefully without it, disabling only the grasp-force
 vibration (the IK-trouble haptics still fire).
 
-The stock [robot-learning-co/trlc-dk1](https://github.com/robot-learning-co/trlc-dk1)
-driver does not ship this method, but it is a small addition on top of
-plumbing the driver already has (`Motor.getTorque()`, which it calls during
-gripper homing). Add to `DK1Follower`:
+On YAM this works out of the box: i2rt reports the gripper motor effort
+in `get_observations()` (`gripper_eff`), and `examples/teleop_bi_yam.py`
+forwards it (plus the gripper position for velocity masking) to
+`teleop.send_feedback({"torques": ...})` every tick. If you write your
+own follower, implement `get_joint_torques()` with the contract above —
+any driver that does gets grasp-force haptics with no other changes.
 
-```python
-def get_joint_torques(self) -> dict[str, float]:
-    # Side-channel for haptics; keep it OUT of observation_features so it
-    # never enters the dataset schema. Return {} if torque is unavailable.
-    self.control.refresh_motor_status(self.motors["gripper"])
-    return {
-        "gripper.torque": float(self.motors["gripper"].getTorque()),
-        "gripper.pos":    ...,  # gripper position normalized to 0..1
-    }
-```
+## Configuration that is YAM-specific
 
-and mirror it on `BiDK1Follower` by calling each arm's `get_joint_torques()`
-and prefixing the keys with `left_` / `right_`. Any driver that implements
-the method with this contract gets grasp-force haptics with no other
-changes.
-
-## Configuration that is DK1-specific
-
-- **URDF path**: `DK1_URDF` env var or `urdf_path` in the config. The
-  URDF lives in the [trlc-dk1
-  repo](https://github.com/robot-learning-co/trlc-dk1) and is not
-  vendored here.
+- **Model path**: the IK builds its MuJoCo model from
+  `robot_models/arm/yam/yam.xml` + the linear_4310 gripper MJCF inside an
+  [i2rt](https://github.com/i2rt-robotics/i2rt) clone (not vendored
+  here). Resolution order: `model_path` in the config, the `YAM_XML` env
+  var, then an `./i2rt` clone in the working directory / repo root.
 - **`r_calib`** (config): the fixed rotation from the Quest's
   `local-floor` world frame into the arm base frame. The default assumes
   the operator faces the robot's front; if your mounting differs,
@@ -262,12 +254,12 @@ changes.
 ## Adapting to a different arm
 
 The `core/` mapping, the `relay/`, and the web client carry over to any
-arm unchanged. The IK does not: `ik/` is written against the DK1's
+arm unchanged. The IK does not: `ik/` is written against the YAM's
 geometry (the wrist-anchor site placement, the gripper-mount frame, a
 6-DoF arm with a roughly spherical wrist whose joints split 3+3 into
-position/orientation). Porting means rebuilding `ik/model.py`'s site
-construction for your URDF and checking the decoupling assumption, not
-just retuning gains. (The camera panel ids — `top`, `left_wrist`,
+position/orientation). Porting means rebuilding `ik/model.py`'s model
+assembly and site construction for your robot's model files and checking
+the decoupling assumption, not just retuning gains. (The camera panel ids — `top`, `left_wrist`,
 `right_wrist` — are also fixed in the relay and web client; rename or
 extend them there if your arm has a different camera set.)
 

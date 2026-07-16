@@ -2,6 +2,11 @@
 certs/
 *.pem
 
+# Local clone of the i2rt repo (YAM model files + hardware driver) — the
+# README instructs cloning it here; the model files are deliberately not
+# vendored.
+i2rt/
+
 __pycache__/
 *.py[cod]
 .venv/

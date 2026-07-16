@@ -3,7 +3,7 @@
   // Live tick rate of get_action() in the teleop process. Populated from
   // ik_state messages once the teleop publishes them; until then we fall
   // back to FALLBACK_LOOP_HZ for the joint-Δq-cap readout. 200 Hz matches
-  // examples/teleop_bi_dk1.py's default; a lerobot-record loop ticks at the
+  // examples/teleop_bi_yam.py's default; a lerobot-record loop ticks at the
   // dataset FPS, which the operator will see snap in shortly after starting.
   const FALLBACK_LOOP_HZ = 200;
   let measuredLoopHz = 0;
@@ -332,7 +332,7 @@
         if (typeof data.right_force_haptic === "number") forceHaptic.right = data.right_force_haptic;
         // Measured teleop tick rate. Used by the joint-Δq-cap readout so
         // the slider shows honest rad/s for whatever loop is actually
-        // driving get_action — examples/teleop_bi_dk1.py ticks at 200,
+        // driving get_action — examples/teleop_bi_yam.py ticks at 200,
         // a lerobot-record loop at the dataset FPS.
         if (typeof data.loop_hz === "number" && data.loop_hz >= 1.0) {
           if (Math.abs(data.loop_hz - measuredLoopHz) > 0.5) {

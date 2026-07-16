@@ -4,8 +4,8 @@ Subscribes to a relay-mode FastAPI server's `/ws` and reads `xr_frame`
 broadcasts (controller poses + buttons + headset pose). Per arm,
 maintains a `ClutchPoseMapper` and a `DecoupledIKSolver`; on the rising edge
 of the grip button, captures the engage frame and starts running
-differential IK each tick. `get_action()` returns the joint action
-dict matching `BiDK1Follower.action_features`:
+differential IK each tick. `get_action()` returns a joint action dict
+for a bimanual YAM follower:
 
     {left,right}_joint_{1..6}.pos   (radians)
     {left,right}_gripper.pos        (normalized 0..1)
@@ -13,7 +13,7 @@ dict matching `BiDK1Follower.action_features`:
 Standard LeRobot-style loop:
 
     teleop = BiQuestTeleoperator(BiQuestTeleoperatorConfig(...))
-    follower = BiDK1Follower(...)
+    follower = <bimanual follower with the action features above>
     teleop.connect(); follower.connect()
     while True:
         follower.send_action(teleop.get_action())
@@ -113,11 +113,12 @@ NQ = 8  # arm (6) + 2 gripper-finger sliders
 # (typically the cloudflared tunnel) stalls and then floods.
 XR_FRAME_STALE_TIMEOUT_S = 0.2
 
-# Gripper prismatic range from the URDF (`gripper_left`, `gripper_right`).
-# Both fingers share the same qpos scale: -0.045 = closed (fingers converge),
-# 0.001 = barely open. Trigger=0 → open (upper), trigger=1 → closed (lower).
-GRIPPER_QPOS_OPEN = 0.001
-GRIPPER_QPOS_CLOSED = -0.045
+# Finger-slider range from the linear_4310 gripper MJCF (`joint7`,
+# `joint8`). Both fingers share the same qpos scale: 0 = open (fingers
+# apart), 0.0475 = closed (fingers converged). Trigger=0 → open,
+# trigger=1 → closed.
+GRIPPER_QPOS_OPEN = 0.0
+GRIPPER_QPOS_CLOSED = 0.0475
 
 
 def _yaw_from_quat_xyzw(q_xyzw) -> float:
@@ -153,10 +154,11 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     ws_url: str = "ws://127.0.0.1:8443/ws"
     publish_ik_state: bool = True
     connect_timeout_s: float = 5.0
-    # Path to the DK1 follower URDF (deliberately not vendored — clone
-    # github.com/robot-learning-co/trlc-dk1). Empty string falls
-    # back to the DK1_URDF environment variable.
-    urdf_path: str = ""
+    # Path to the YAM arm MJCF inside an i2rt clone (deliberately not
+    # vendored — clone github.com/i2rt-robotics/i2rt). Empty string falls
+    # back to the YAM_XML environment variable, then an ./i2rt clone in
+    # the working directory / repo root (see ik/model.py).
+    model_path: str = ""
     # 3x3 rotation (row-major) taking Quest world vectors into the arm
     # base frame. See DEFAULT_R_CALIB above for the convention and the
     # README for how to re-derive it for a different mounting.
@@ -228,8 +230,9 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     # ── Force haptic (gripper torque → controller vibration) ──
     # Linear scaling with a dead zone:
     #   intensity = clip((|τ| - threshold) / (max - threshold), 0, 1)
-    # Defaults sized to the DK1 gripper (max_gripper_torque=1.0 Nm in the
-    # follower config). Bump the per-arm threshold to silence idle baseline
+    # Defaults sized to a gripper commanding ~1 Nm at max grip (the YAM
+    # linear_4310 lands in the same range; recalibrate per setup via the
+    # web UI). Bump the per-arm threshold to silence idle baseline
     # buzz on that arm specifically (static holding torque differs between
     # individual grippers, so we deadband independently); bump `max_nm` if
     # you want the buzz to stay subtle even at max grip. The web Settings
@@ -294,7 +297,7 @@ class BiQuestTeleoperator(Teleoperator):
             qpos_init = np.zeros(NQ)
             qpos_init[:ARM_DOFS] = q_rest
             arm_solver = DecoupledIKSolver(
-                urdf_path=config.urdf_path or None,
+                model_path=config.model_path or None,
                 lam_pos=config.lam,
                 lam0=config.lam0,
                 w0=config.w0,
@@ -436,7 +439,7 @@ class BiQuestTeleoperator(Teleoperator):
 
     def send_feedback(self, feedback: dict) -> None:
         """Push runtime feedback from the orchestrator (a rollout loop or
-        examples/teleop_bi_dk1.py) into the teleop's per-arm haptic state. The values
+        examples/teleop_bi_yam.py) into the teleop's per-arm haptic state. The values
         are broadcast in the next ``ik_state`` and mixed with the existing
         IK-derived haptic on the web client.
 
@@ -982,7 +985,7 @@ class BiQuestTeleoperator(Teleoperator):
         # Per-arm gripper-torque deadband (Nm). Lower than the worst static
         # holding torque and the operator gets idle-buzz; higher than the
         # contact-force range and they never feel grasps. Upper bound matches
-        # the DK1 follower's `max_gripper_torque` ceiling so a runaway slider
+        # the default `force_haptic_max_nm` ceiling so a runaway slider
         # can't silence real contact entirely.
         "force_haptic_threshold_nm_left": (0.0, 1.0),
         "force_haptic_threshold_nm_right": (0.0, 1.0),
