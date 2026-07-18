@@ -142,8 +142,8 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     They serve two roles: (a) the teleop initialises each arm's qpos here
     so the first `send_action` moves the physical follower toward the
     rest pose; (b) the IK Tikhonov bias pulls toward this pose, breaking
-    the elbow-flip ambiguity. Default is the elbow-up
-    [0, π/2, π/2, 0, 0, 0]; override per machine to match wherever your
+    the elbow-flip ambiguity. Default is the all-zeros folded park pose
+    [0, 0, 0, 0, 0, 0]; override per machine to match wherever your
     setup parks the arms.
     """
 

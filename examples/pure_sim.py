@@ -27,8 +27,6 @@ import argparse
 import logging
 import time
 
-import numpy as np
-
 from vr_teleop_kit.lerobot.bi_quest_teleop import (
     BiQuestTeleoperator,
     BiQuestTeleoperatorConfig,
@@ -56,7 +54,7 @@ def main() -> None:
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
-    fallback = [0.0, float(np.pi / 2), float(np.pi / 2), 0.0, 0.0, 0.0]
+    fallback = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     rest_left = parse_rest_pose_env("LEFT_REST_POSE", fallback)
     rest_right = parse_rest_pose_env("RIGHT_REST_POSE", fallback)
 

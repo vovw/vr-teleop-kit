@@ -136,8 +136,8 @@ def main() -> None:
     )
 
     rests = {
-        "left": parse_rest_pose_env("LEFT_REST_POSE", [0.0, np.pi / 2, np.pi / 2, 0.0, 0.0, 0.0]),
-        "right": parse_rest_pose_env("RIGHT_REST_POSE", [0.0, np.pi / 2, np.pi / 2, 0.0, 0.0, 0.0]),
+        "left": parse_rest_pose_env("LEFT_REST_POSE", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "right": parse_rest_pose_env("RIGHT_REST_POSE", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     }
     robots = {h: get_yam_robot(channel=channels[h], sim=args.sim) for h in hands}
 

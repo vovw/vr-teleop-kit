@@ -6,7 +6,7 @@ client on the Quest.
 
 At startup, the teleop's internal qpos is initialised to the rest pose
 (LEFT_REST_POSE / RIGHT_REST_POSE env vars, seven comma-separated values
-with the trailing gripper dropped; elbow-up default if unset), and
+with the trailing gripper dropped; all-zeros default if unset), and
 `ramp_to_rest()` drives the physical arms there in linearly-interpolated
 steps (--rest-duration-s / --rest-steps). The operator can then squeeze
 grip to engage and start teleoperating from the same anchor pose.
@@ -135,7 +135,7 @@ def main() -> None:
             "(pip install -e path/to/i2rt)."
         ) from e
 
-    fallback = [0.0, float(np.pi / 2), float(np.pi / 2), 0.0, 0.0, 0.0]
+    fallback = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     rest_left = parse_rest_pose_env("LEFT_REST_POSE", fallback)
     rest_right = parse_rest_pose_env("RIGHT_REST_POSE", fallback)
     ik_overrides = ik_kwargs_from_args(args)

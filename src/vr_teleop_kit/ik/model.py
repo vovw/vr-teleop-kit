@@ -63,7 +63,8 @@ _MOUNT_AXIS = "0 0 -1"
 _TOOL0_POS = [0.0, 0.0, -0.1347]
 _TOOL0_QUAT = [0.0, 1.0, 0.0, 0.0]
 
-DEFAULT_Q_REST = np.array([0.0, np.pi / 2, np.pi / 2, 0.0, 0.0, 0.0])
+# Startup / go-home pose: all joints at zero (the YAM's folded park pose).
+DEFAULT_Q_REST = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 def resolve_model_path(explicit: str | Path | None = None) -> Path:

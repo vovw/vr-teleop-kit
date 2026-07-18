@@ -73,7 +73,6 @@ _reexec_under_mjpython_if_needed()
 
 import mujoco  # noqa: E402
 import mujoco.viewer  # noqa: E402
-import numpy as np  # noqa: E402
 import websockets  # noqa: E402
 
 from vr_teleop_kit.ik.model import build_model_with_tool0_site  # noqa: E402
@@ -150,11 +149,9 @@ def main() -> None:
 
     model, data = build_model_with_tool0_site(args.model)
 
-    # Start at home pose so the viewer has something to show before any
-    # ik_state arrives.
+    # Start at home pose (all joints zero) so the viewer has something to
+    # show before any ik_state arrives.
     data.qpos[:] = 0
-    data.qpos[1] = np.pi / 2
-    data.qpos[2] = np.pi / 2
     mujoco.mj_forward(model, data)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
