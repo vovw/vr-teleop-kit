@@ -27,7 +27,7 @@ flowchart LR
     IN(["target pose<br/>+ qpos seed"])
 
     subgraph POS["Position &middot; joints 1-3"]
-        direction TB
+        direction LR
         P1["FK at seed"]
         P2["position error<br/>at j4 anchor"]
         P3["damped<br/>least squares<br/>+ posture bias"]
@@ -35,7 +35,7 @@ flowchart LR
     end
 
     subgraph ROT["Orientation &middot; joints 4-6"]
-        direction TB
+        direction LR
         R1["FK at updated<br/>joints 1-3"]
         R2["orientation<br/>error"]
         R3{"past<br/>~126&deg;?"}
@@ -59,6 +59,8 @@ flowchart LR
     class R3,R5 guard
     style POS fill:#e8f0fe,stroke:#4285f4,color:#202124
     style ROT fill:#e6f4ea,stroke:#34a853,color:#202124
+    style IN fill:#37474f,stroke:#90a4ae,color:#ffffff
+    style OUT fill:#37474f,stroke:#90a4ae,color:#ffffff
 ```
 
 The position stage runs first; the orientation stage then FKs at the
