@@ -12,7 +12,7 @@ subscribes from the other side. Verifies:
   - left arm stays at home (untouched in this test)
 
 Prereqs: relay running locally (vr-teleop-relay), lerobot installed,
-DK1_URDF pointing at the URDF.
+the YAM model files reachable (./i2rt clone or YAM_XML — see the README).
 
 Run:
     python tools/smoke_test.py

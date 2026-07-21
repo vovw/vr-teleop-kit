@@ -1,10 +1,9 @@
 """Single-arm adapter around `BiQuestTeleoperator`.
 
 The bimanual `BiQuestTeleoperator` emits action keys prefixed with
-``left_`` / ``right_`` so it can drive `BiDK1Follower`. Single-arm
-followers (`DK1Follower`) expect unprefixed keys like ``joint_1.pos``,
-so this adapter wraps the bimanual teleop and strips the prefix for one
-chosen arm. Useful for DAgger interventions on a policy trained on a
+``left_`` / ``right_`` so it can drive a bimanual follower. Single-arm
+followers expect unprefixed keys like ``joint_1.pos``, so this adapter
+wraps the bimanual teleop and strips the prefix for one chosen arm. Useful for DAgger interventions on a policy trained on a
 single arm: the operator can still wear both Quest controllers (one
 drives, the other is idle / used for the B/Y handoff button), but the
 action dict landing on the robot matches the single-arm schema.
@@ -25,13 +24,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-try:
-    from lerobot.teleoperators.teleoperator import Teleoperator, TeleoperatorConfig
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "lerobot is required to use SingleArmQuestTeleoperator."
-    ) from e
-
+# Real LeRobot base classes when lerobot is installed, lightweight
+# stand-ins otherwise (see _compat) — a teleop-only box needs no torch.
+from ._compat import Teleoperator, TeleoperatorConfig
 from .bi_quest_teleop import BiQuestTeleoperator, BiQuestTeleoperatorConfig
 
 

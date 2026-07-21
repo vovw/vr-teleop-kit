@@ -1,5 +1,5 @@
 """Shared helpers for the VR-teleop entry points (`examples/pure_sim.py`,
-`examples/teleop_bi_dk1.py`). Each script defines its own loop and CLI; this module
+`examples/teleop_bi_yam.py`). Each script defines its own loop and CLI; this module
 holds the bits that would otherwise be copy-pasted.
 """
 

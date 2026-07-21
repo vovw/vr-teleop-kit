@@ -5,7 +5,7 @@ Two responsibilities, both per WebSocket client:
   1. Broadcast relay for pose/state messages (xr_frame, ik_state,
      config_update, … — the full set is RELAY_TYPES below) between the
      Quest browser and the pose-streaming client
-     (e.g. `examples/teleop_bi_dk1.py`).
+     (e.g. `examples/teleop_bi_yam.py`).
 
   2. WebRTC publisher for camera tracks. CAM_TOP / CAM_LEFT / CAM_RIGHT
      env vars point at v4l2 devices. On webrtc_request the server opens any cameras that exist,

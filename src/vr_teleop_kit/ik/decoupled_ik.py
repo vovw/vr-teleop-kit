@@ -1,10 +1,11 @@
-"""Decoupled IK for the TRLC-DK1 arm — strict joint decoupling.
+"""Decoupled IK for the I2RT YAM arm — strict joint decoupling.
 
 Joints 1-3 satisfy position; joints 4-6 satisfy orientation. Both
 sub-problems are one damped-least-squares step per call, warm-started
-from the caller's qpos. The 6.2 cm wrist non-sphericity becomes a
-residual EE position error when the wrist rotates — that's intentional.
-The operator's visual feedback loop closes the gap.
+from the caller's qpos. The wrist axes don't intersect in a single
+point (a few cm of non-sphericity), which becomes a residual EE
+position error when the wrist rotates — that's intentional. The
+operator's visual feedback loop closes the gap.
 
 Always returns a valid qpos6 (never None). Four boundary cases are
 handled in-line so the arm degrades gracefully instead of freezing:
@@ -16,7 +17,7 @@ handled in-line so the arm degrades gracefully instead of freezing:
      orientation Jacobian loses rank. Same adaptive-damping recipe on
      the wrist sub-solve: J4/J6 steps stay bounded and the lost rotation
      direction is simply not tracked until the operator backs off.
-  3. Joint limit violation — elementwise clamp into URDF limits. Caller
+  3. Joint limit violation — elementwise clamp into model limits. Caller
      sees the arm reach as far as joints allow, with the residual EE
      error left for the operator's visual loop.
   4. Near-antipodal orientation demand (error angle past rot_err_hold) —
@@ -51,7 +52,7 @@ def _quat_wxyz_to_R(q: np.ndarray) -> np.ndarray:
 
 
 class DecoupledIKSolver:
-    """Decoupled IK for TRLC-DK1.
+    """Decoupled IK for the YAM arm.
 
     Holds a mujoco model with the tool0 site, plus cached site/body-id
     lookups. `solve()` is the main entry point.
@@ -95,7 +96,7 @@ class DecoupledIKSolver:
 
     def __init__(
         self,
-        urdf_path: Path | None = None,
+        model_path: Path | None = None,
         lam_pos: float = 0.05,
         lam0: float = 0.15,
         w0: float = 0.05,
@@ -124,17 +125,17 @@ class DecoupledIKSolver:
             else np.asarray(max_dq_per_joint, dtype=float).reshape(6).copy()
         )
 
-        self.model, self.data = build_model_with_tool0_site(urdf_path)
-        # Joint limits straight from the compiled model (i.e. the URDF) —
+        self.model, self.data = build_model_with_tool0_site(model_path)
+        # Joint limits straight from the compiled model (i.e. the MJCF) —
         # nothing transcribed by hand.
         self.joint_limits = self.model.jnt_range[:6].copy()
 
         self.site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "tool0"
         )
-        # Position-task anchor — a named site on link3-4, 10 cm past joint
+        # Position-task anchor — a named site on link3, 10 cm past joint
         # 4 along the link3→link4 direction. Fully wrist-invariant since
-        # it lives upstream of joint 4. See ik/solver.py for the exact
+        # it lives upstream of joint 4. See ik/model.py for the exact
         # site placement and the rationale.
         self.j4_site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "j4_anchor"

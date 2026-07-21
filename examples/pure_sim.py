@@ -2,11 +2,12 @@
 
 Runs `BiQuestTeleoperator` against the Quest pose stream and publishes
 `ik_state` back to the relay so `tools/viewer_client.py` can render the
-resulting qpos in mujoco. Same IK pipeline as `teleop_bi_dk1.py` minus
-the BiDK1Follower / port handling — useful for testing IK behavior
-without needing the physical robot powered up.
+resulting qpos in mujoco. Same IK pipeline as `teleop_bi_yam.py` minus
+the i2rt hardware handling — useful for testing IK behavior without
+needing the physical robot powered up.
 
-Quick test workflow (no robot needed; DK1_URDF must point at the URDF):
+Quick test workflow (no robot needed; the YAM model files are found in
+an ./i2rt clone automatically, or set YAM_XML — see the README):
   1. Relay server up:        vr-teleop-relay
      (USB via `adb reverse` or LAN HTTPS — see the README)
   2. Mujoco viewer up:       python tools/viewer_client.py
@@ -26,8 +27,6 @@ import argparse
 import logging
 import time
 
-import numpy as np
-
 from vr_teleop_kit.lerobot.bi_quest_teleop import (
     BiQuestTeleoperator,
     BiQuestTeleoperatorConfig,
@@ -38,7 +37,7 @@ from vr_teleop_kit.lerobot.cli import (
     parse_rest_pose_env,
 )
 
-from lerobot.utils.utils import init_logging
+from vr_teleop_kit.lerobot import init_logging
 
 
 def main() -> None:
@@ -55,7 +54,7 @@ def main() -> None:
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
-    fallback = [0.0, float(np.pi / 2), float(np.pi / 2), 0.0, 0.0, 0.0]
+    fallback = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     rest_left = parse_rest_pose_env("LEFT_REST_POSE", fallback)
     rest_right = parse_rest_pose_env("RIGHT_REST_POSE", fallback)
 
