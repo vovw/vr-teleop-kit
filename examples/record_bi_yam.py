@@ -44,7 +44,7 @@ import time
 
 import numpy as np
 
-from vr_teleop_kit.lerobot import init_logging
+from vr_teleop_kit.log import get_logger, setup_logging
 from vr_teleop_kit.lerobot.bi_quest_teleop import (
     BiQuestTeleoperator,
     BiQuestTeleoperatorConfig,
@@ -61,6 +61,12 @@ from teleop_bi_yam import ARM_DOFS, _command_arm, _gripper_feedback, ramp_to_res
 
 # Hold right-B + left-Y this long (while idle) to end the session.
 END_SESSION_HOLD_S = 1.5
+
+# Owner prefix used when --repo-id is omitted. The full default id gets a
+# wall-clock stamp appended (yam-teleop-<YYYYmmdd-HHMMSS>) so back-to-back
+# sessions land in fresh folders — LeRobotDataset.create errors on an
+# existing repo.
+DEFAULT_REPO_OWNER = "atharva"
 
 
 def _obs_vector(hands: tuple[str, ...], robots: dict) -> np.ndarray:
@@ -89,14 +95,17 @@ def _feature_names(hands: tuple[str, ...]) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo-id", required=True, help="dataset repo id (e.g. you/yam-towels)")
-    ap.add_argument("--task", required=True, help="task string stored with every frame")
+    ap.add_argument("--repo-id", default=None,
+                    help="dataset repo id (e.g. you/yam-towels). "
+                         "Default: atharva/yam-teleop-<YYYYmmdd-HHMMSS>")
+    ap.add_argument("--task", default="teleop",
+                    help="task string stored with every frame (default: 'teleop')")
     ap.add_argument("--root", default=None, help="local dataset root (default: LeRobot's)")
     ap.add_argument("--fps", type=int, default=30, help="dataset + control-loop rate")
     ap.add_argument("--num-episodes", type=int, default=0,
                     help="stop after this many saved episodes (0 = until ended from VR)")
-    ap.add_argument("--left-can", default="can_left", help="left arm CAN interface")
-    ap.add_argument("--right-can", default="can_right", help="right arm CAN interface")
+    ap.add_argument("--left-can", default="can1", help="left arm CAN interface (default: can1)")
+    ap.add_argument("--right-can", default="can0", help="right arm CAN interface (default: can0)")
     ap.add_argument("--arm", choices=("both", "left", "right"), default="both")
     ap.add_argument("--sim", action="store_true",
                     help="use i2rt sim robots (rehearse the recording flow, no hardware)")
@@ -106,9 +115,15 @@ def main() -> None:
     add_ik_cli_args(ap)
     args = ap.parse_args()
 
-    init_logging()
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
+    setup_logging(level=logging.INFO)
+    logger = get_logger(__name__, "session")
+
+    # Wall-clock session stamp: names the default repo and anchors the logs.
+    session_start = time.time()
+    session_stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(session_start))
+    if args.repo_id is None:
+        args.repo_id = f"{DEFAULT_REPO_OWNER}/yam-teleop-{session_stamp}"
+        logger.info("no --repo-id given; using default %s", args.repo_id)
 
     try:
         from i2rt.robots.get_robot import get_yam_robot
@@ -117,7 +132,7 @@ def main() -> None:
             "i2rt is required. Clone https://github.com/i2rt-robotics/i2rt "
             "and install it (pip install -e path/to/i2rt)."
         ) from e
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 
     hands: tuple[str, ...] = ("left", "right") if args.arm == "both" else (args.arm,)
     channels = {"left": args.left_can, "right": args.right_can}
@@ -134,6 +149,10 @@ def main() -> None:
             "action": {"dtype": "float32", "shape": (len(names),), "names": names},
         },
     )
+    logger.info("dataset %s — LeRobot codebase %s, %d fps, %d-dim state/action, videos=%s",
+                args.repo_id, CODEBASE_VERSION, args.fps, len(names), False)
+    logger.info("session started %s — writing to %s",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_start)), dataset.root)
 
     rests = {
         "left": parse_rest_pose_env("LEFT_REST_POSE", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
@@ -149,8 +168,9 @@ def main() -> None:
         **ik_kwargs_from_args(args),
     ))
     teleop.connect()
+    arm_logs = {h: get_logger(f"{__name__}.{h}", f"arm{h}") for h in hands}
     for h in hands:
-        ramp_to_rest(robots[h], rests[h], args.rest_duration_s, args.rest_steps, logger, h)
+        ramp_to_rest(robots[h], rests[h], args.rest_duration_s, args.rest_steps, arm_logs[h], h)
 
     logger.info("──────────────────────────────────────────────────")
     logger.info("VR recording controls:")
@@ -161,9 +181,12 @@ def main() -> None:
 
     recording = False
     frames_in_episode = 0
+    episode_start = 0.0
+    total_frames = 0
     last_b = last_y = False
     both_held_since: float | None = None
     period = 1.0 / args.fps
+    interrupted = False
 
     try:
         next_tick = time.perf_counter()
@@ -186,19 +209,26 @@ def main() -> None:
                 if b and not last_b:
                     if not recording:
                         recording, frames_in_episode = True, 0
-                        logger.info("● episode %d STARTED", dataset.num_episodes)
+                        episode_start = time.perf_counter()
+                        logger.info("● episode %d STARTED at %s",
+                                    dataset.num_episodes, time.strftime("%H:%M:%S"))
                     elif frames_in_episode > 0:
+                        dur = time.perf_counter() - episode_start
+                        total_frames += frames_in_episode
                         dataset.save_episode()
                         recording = False
-                        logger.info("✓ episode %d SAVED (%d frames)",
-                                    dataset.num_episodes - 1, frames_in_episode)
+                        logger.info("✓ episode %d SAVED (%d frames, %.1fs, %.1f fps) — %d frames total",
+                                    dataset.num_episodes - 1, frames_in_episode, dur,
+                                    frames_in_episode / dur if dur > 0 else 0.0, total_frames)
                         if args.num_episodes and dataset.num_episodes >= args.num_episodes:
                             logger.info("reached --num-episodes=%d", args.num_episodes)
                             break
                 if y and not last_y and recording:
+                    dur = time.perf_counter() - episode_start
                     dataset.clear_episode_buffer()
                     recording = False
-                    logger.info("✗ episode DISCARDED (%d frames) — go again", frames_in_episode)
+                    logger.info("✗ episode DISCARDED (%d frames, %.1fs) — go again",
+                                frames_in_episode, dur)
             last_b, last_y = b, y
 
             # lerobot-record ordering: observe, act, command, write.
@@ -229,14 +259,36 @@ def main() -> None:
             else:
                 next_tick = time.perf_counter()
     except KeyboardInterrupt:
-        logger.info("interrupted")
+        interrupted = True
+        logger.info("interrupted — parking arms at home pose (Ctrl-C again to power off)")
     finally:
         if recording:
             dataset.clear_episode_buffer()
             logger.info("open episode discarded (session ended mid-episode)")
         if hasattr(dataset, "finalize"):
             dataset.finalize()
-        logger.info("session done: %d episode(s) at %s", dataset.num_episodes, dataset.root)
+        elapsed = time.time() - session_start
+        logger.info("session done: %d episode(s), %d frames, %s elapsed",
+                    dataset.num_episodes, total_frames,
+                    time.strftime("%H:%M:%S", time.gmtime(elapsed)))
+        logger.info("dataset %s (LeRobot %s) at %s",
+                    args.repo_id, CODEBASE_VERSION, dataset.root)
+
+        # First Ctrl-C brings us here with the arms still powered: ramp them
+        # back to the home/rest pose and hold there. A second Ctrl-C (or a
+        # session ended cleanly from VR) then powers the arms off. A Ctrl-C
+        # during the ramp itself skips straight to power-off.
+        try:
+            for h in hands:
+                ramp_to_rest(robots[h], rests[h], args.rest_duration_s,
+                             args.rest_steps, arm_logs[h], h)
+            if interrupted:
+                logger.info("arms parked at home — press Ctrl-C again to power off")
+                while True:
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            logger.info("powering off")
+
         try:
             teleop.disconnect()
         finally:

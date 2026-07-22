@@ -103,10 +103,13 @@ ARM_DOFS = 6
 NQ = 8  # arm (6) + 2 gripper-finger sliders
 
 # If no xr_frame has been received in this many seconds, treat the
-# controller stream as stale: force-disengage any engaged arm and
-# refuse to start a new engagement. Protects against the
-# "buffer-burst → catch-up motion" failure mode when the WS connection
-# (typically the cloudflared tunnel) stalls and then floods.
+# controller stream as stale: _update_arm pauses (early-returns before any
+# IK, so no motion) and flags a re-anchor, and no new engagement can start
+# while stale. Protects against the "buffer-burst → catch-up motion" failure
+# mode when the WS connection (typically the cloudflared tunnel) stalls and
+# then floods. Note: staleness only *pauses* — it does not by itself drop an
+# active engagement; the level-triggered clutch release in _update_arm is what
+# guarantees the arm never follows the controller with the grip button up.
 XR_FRAME_STALE_TIMEOUT_S = 0.2
 
 # Finger-slider range from the linear_4310 gripper MJCF (`joint7`,
@@ -775,6 +778,14 @@ class BiQuestTeleoperator(Teleoperator):
 
         buttons = ctrl.get("buttons") or []
         grip = bool(buttons[GRIP_BUTTON_INDEX]["p"]) if len(buttons) > GRIP_BUTTON_INDEX else False
+        # Log the raw grip-button signal on every edge (INFO so it lands in the
+        # saved log). This is the ground truth for "the arm moved without me
+        # pressing the clutch": if the arm follows while this shows grip=0, the
+        # bug is downstream (engagement state); if it shows grip=1 when the
+        # operator isn't pressing, the button data itself is wrong (Quest/WS).
+        if grip != arm["last_grip"]:
+            logger.info("%s grip button %s (engaged=%s)",
+                        hand, "PRESSED" if grip else "released", arm["engaged"])
         trigger = float(buttons[TRIGGER_BUTTON_INDEX]["v"]) if len(buttons) > TRIGGER_BUTTON_INDEX else 0.0
         precision = (
             bool(buttons[PRECISION_BUTTON_INDEX]["p"]) if len(buttons) > PRECISION_BUTTON_INDEX else False
@@ -831,10 +842,28 @@ class BiQuestTeleoperator(Teleoperator):
             self._anchor_mapper(hand, arm, pos, quat_wxyz, yaw_now, "RE-ANCHOR")
         arm["needs_reanchor"] = False
 
-        # Edge-detect clutch.
+        # Clutch. ENGAGE on the rising edge (anchors the engage frame at the
+        # current pose). DISENGAGE is level-triggered, not edge-triggered: any
+        # tick where the grip is not held forces disengagement whenever the arm
+        # is still engaged. Edge-only release is unsafe — if a tick is missed
+        # while the operator lets go (e.g. the control loop stalls on a gripper
+        # hardware fault, so get_action isn't called across the release), the
+        # falling edge never runs, `engaged` stays True, and the arm keeps
+        # following the controller with NO button held. Leveling the release
+        # guarantees the invariant: engaged ⟹ grip currently held. (See the
+        # seed_qpos_from_obs docstring for the same missed-edge failure mode on
+        # the handoff path.)
         if grip and not arm["last_grip"]:
             self._anchor_mapper(hand, arm, pos, quat_wxyz, yaw_now, "ENGAGE")
-        elif not grip and arm["last_grip"]:
+        elif not grip and arm["engaged"]:
+            if not arm["last_grip"]:
+                # We were still engaged despite the grip having read released
+                # on a prior tick — the falling edge was missed (a stalled
+                # tick). Warn so the saved log shows the safety net firing.
+                logger.warning(
+                    "%s clutch: caught stuck engagement with grip released "
+                    "(missed release edge) — force-disengaging", hand,
+                )
             arm["mapper"].disengage()
             arm["engaged"] = False
             # Drop the pose filter on release so the next engage captures

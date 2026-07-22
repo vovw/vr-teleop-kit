@@ -46,7 +46,7 @@ from vr_teleop_kit.lerobot.cli import (
     parse_rest_pose_env,
 )
 
-from vr_teleop_kit.lerobot import init_logging
+from vr_teleop_kit.log import get_logger, setup_logging
 
 ARM_DOFS = 6
 
@@ -93,21 +93,21 @@ def ramp_to_rest(
     target = np.array(list(rest_joints) + [1.0])  # i2rt gripper: 1 = open
     start = np.asarray(robot.get_joint_pos(), dtype=float).copy()
 
-    logger.info("[%s] ramping to rest pose over %.1fs in %d steps", label, duration_s, steps)
+    logger.info("ramping to rest pose over %.1fs in %d steps", duration_s, steps)
     dt = duration_s / max(1, steps)
     for i in range(1, steps + 1):
         alpha = i / steps
         robot.command_joint_pos(start + alpha * (target - start))
         time.sleep(dt)
-    logger.info("[%s] rest pose reached", label)
+    logger.info("rest pose reached")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--left-can", required=True,
-                    help="left arm CAN interface (e.g. can_left / can0)")
-    ap.add_argument("--right-can", required=True,
-                    help="right arm CAN interface (e.g. can_right / can1)")
+    ap.add_argument("--left-can", default="can1",
+                    help="left arm CAN interface (default: can1)")
+    ap.add_argument("--right-can", default="can0",
+                    help="right arm CAN interface (default: can0)")
     ap.add_argument("--ws-url", default="ws://127.0.0.1:8443/ws", help="relay server WS URL")
     ap.add_argument("--freq", type=int, default=200, help="teleop loop rate (Hz)")
     ap.add_argument("--rest-duration-s", type=float, default=3.0,
@@ -122,9 +122,8 @@ def main() -> None:
     add_ik_cli_args(ap)
     args = ap.parse_args()
 
-    init_logging()
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
+    setup_logging(level=logging.INFO)
+    logger = get_logger(__name__, "session")
 
     try:
         from i2rt.robots.get_robot import get_yam_robot
@@ -166,9 +165,10 @@ def main() -> None:
 
     teleop.connect()
 
+    arm_logs = {hand: get_logger(f"{__name__}.{hand}", f"arm{hand}") for hand in hands}
     for hand in hands:
         ramp_to_rest(robots[hand], rests[hand], args.rest_duration_s,
-                     args.rest_steps, logger, hand)
+                     args.rest_steps, arm_logs[hand], hand)
 
     period = 1.0 / args.freq
     logger.info("vr-teleop running at %d Hz (arm=%s); Ctrl-C to stop", args.freq, args.arm)

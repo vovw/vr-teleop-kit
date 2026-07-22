@@ -161,6 +161,26 @@ place: the hand rotates, the wrist pivot stays still), then
 **Start Teleop**. Settings (gains, smoothing, velocity caps, haptics)
 are on the same page and apply live.
 
+## Cameras
+
+The relay auto-discovers RealSense color streams at startup — no
+`source cams.env` needed. Discovery globs `/dev/v4l/by-id` for the color
+node (index 4 on the D405) and matches each camera's serial to a role
+(`top` / `left` / `right`) via the map in
+`src/vr_teleop_kit/relay/cameras.py`. Update that map when you swap a
+camera, or point `CAM_MAP` at a JSON file (`{"<serial>": "<role>"}`) to
+override without editing code.
+
+```bash
+python tools/gen_cams_env.py          # print what's detected (no writes)
+python tools/gen_cams_env.py --write  # (re)generate ./cams.env to source elsewhere
+```
+
+`cams.env` is now a generated, gitignored artifact — handy for a shell
+that needs the `CAM_*` vars (e.g. the recorder). An explicit `CAM_TOP` /
+`CAM_LEFT` / `CAM_RIGHT` still overrides discovery for that role;
+`CAM_*_ROTATE` (0/90/180/270) and `CAM_COLOR_INDEX` tune capture.
+
 ## Try it without a robot
 
 ```bash

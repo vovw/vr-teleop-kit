@@ -7,8 +7,9 @@ Two responsibilities, both per WebSocket client:
      Quest browser and the pose-streaming client
      (e.g. `examples/teleop_bi_yam.py`).
 
-  2. WebRTC publisher for camera tracks. CAM_TOP / CAM_LEFT / CAM_RIGHT
-     env vars point at v4l2 devices. On webrtc_request the server opens any cameras that exist,
+  2. WebRTC publisher for camera tracks. Cameras are auto-discovered by
+     serial (see relay/cameras.py); CAM_TOP / CAM_LEFT / CAM_RIGHT env vars
+     override a role's device. On webrtc_request the server opens any cameras that exist,
      creates an RTCPeerConnection with one VideoStreamTrack per camera,
      and exchanges SDP/ICE over the same WebSocket. Per-camera enable
      toggles (camera_toggle messages) mute the track by repeating the
@@ -33,14 +34,12 @@ import asyncio
 import json
 import logging
 import os
-import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import av
-import cv2
 import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.rtcrtpsender import RTCRtpSender
@@ -48,11 +47,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("vr_teleop")
+from vr_teleop_kit.relay.capture import CameraReader, CameraSpec, build_camera_specs
+from vr_teleop_kit.log import get_logger, setup_logging
+
+setup_logging(level=logging.INFO)
+logger = get_logger("vr_teleop", "relay")
+cam_log = get_logger("vr_teleop.camera", "camera")
+ws_log = get_logger("vr_teleop.ws", "ws")
+rtc_log = get_logger("vr_teleop.webrtc", "webrtc")
 WEB_DIR = Path(__file__).parent / "web"
 
 # WebSocket message types broadcast verbatim to every other connected client.
@@ -65,78 +67,10 @@ RELAY_TYPES = {
 
 
 # ── Camera capture ───────────────────────────────────────────────────────
-# One CameraReader per v4l2 device. The reader runs a blocking cv2 loop in
-# a background thread; the latest frame is published via a lock-protected
-# slot. CameraTrack.recv() (called by aiortc at the negotiated fps) reads
-# from the slot. A single reader can fan out to multiple peer connections.
-
-@dataclass(frozen=True)
-class CameraSpec:
-    """Camera identity + capture parameters. `id` matches the WS schema
-    (top | left_wrist | right_wrist); `label` is the human-facing name;
-    `rotate` is 0/90/180/270 degrees applied in the capture thread so
-    every consumer sees the corrected frame (no client-side fix-up)."""
-    id: str
-    label: str
-    device: str
-    width: int
-    height: int
-    fps: int
-    rotate: int  # 0 | 90 | 180 | 270
-
-
-# cv2 rotation lookup. 0 → no rotation; other values map to the cv2 constants.
-_ROTATE_CODES = {
-    90:  cv2.ROTATE_90_CLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-}
-
-
-class CameraReader:
-    """Background v4l2 grabber. Thread-safe latest-frame slot."""
-
-    def __init__(self, spec: CameraSpec) -> None:
-        self.spec = spec
-        self._lock = threading.Lock()
-        self._frame: np.ndarray | None = None
-        self._stop = threading.Event()
-        self._cap = cv2.VideoCapture(spec.device, cv2.CAP_V4L2)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"cannot open camera {spec.id} at {spec.device}")
-        # MJPG is much cheaper than YUYV for these UVC cams at 640x480@30.
-        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, spec.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, spec.height)
-        self._cap.set(cv2.CAP_PROP_FPS, spec.fps)
-        self._thread = threading.Thread(
-            target=self._loop, name=f"cam-{spec.id}", daemon=True
-        )
-        self._thread.start()
-        logger.info("camera %s opened (%s, %dx%d@%d rotate=%d)",
-                    spec.id, spec.device, spec.width, spec.height, spec.fps, spec.rotate)
-
-    def _loop(self) -> None:
-        rotate_code = _ROTATE_CODES.get(self.spec.rotate)
-        while not self._stop.is_set():
-            ok, frame = self._cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
-            if rotate_code is not None:
-                frame = cv2.rotate(frame, rotate_code)
-            with self._lock:
-                self._frame = frame
-
-    def latest(self) -> np.ndarray | None:
-        with self._lock:
-            return self._frame
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=1.0)
-        self._cap.release()
-
+# Frame grabbing lives in relay/capture.py (CameraReader / CameraSpec /
+# build_camera_specs), shared with the dataset recorder. CameraTrack below is
+# the relay-only WebRTC adapter: it pulls from a CameraReader and hands frames
+# to aiortc, so it stays here with the av/aiortc deps.
 
 class CameraTrack(VideoStreamTrack):
     """aiortc track that pulls from a CameraReader. `enabled=False` returns
@@ -176,45 +110,12 @@ class CameraTrack(VideoStreamTrack):
 
 
 # ── Camera registry ──────────────────────────────────────────────────────
-# Only cameras whose device path exists are registered. The Quest UI is
-# populated from this list (camera_list message on WS open), so missing
-# cameras silently disappear instead of erroring at peer-connect time.
+# Only cameras whose device path exists are registered (build_camera_specs in
+# relay/capture.py). The Quest UI is populated from this list (camera_list
+# message on WS open), so missing cameras silently disappear instead of
+# erroring at peer-connect time.
 
-def _build_camera_specs() -> list[CameraSpec]:
-    width = int(os.environ.get("CAM_WIDTH", "640"))
-    height = int(os.environ.get("CAM_HEIGHT", "480"))
-    fps = int(os.environ.get("CAM_FPS", "30"))
-
-    def _rotate(env_key: str) -> int:
-        raw = os.environ.get(env_key, "0").strip() or "0"
-        try:
-            r = int(raw) % 360
-        except ValueError:
-            logger.warning("%s=%r not an int, defaulting to 0", env_key, raw)
-            return 0
-        if r not in (0, 90, 180, 270):
-            logger.warning("%s=%d not in {0,90,180,270}, defaulting to 0", env_key, r)
-            return 0
-        return r
-
-    candidates = [
-        ("top",         "Top",         os.environ.get("CAM_TOP"),   _rotate("CAM_TOP_ROTATE")),
-        ("left_wrist",  "Left wrist",  os.environ.get("CAM_LEFT"),  _rotate("CAM_LEFT_ROTATE")),
-        ("right_wrist", "Right wrist", os.environ.get("CAM_RIGHT"), _rotate("CAM_RIGHT_ROTATE")),
-    ]
-    specs: list[CameraSpec] = []
-    for cam_id, label, device, rotate in candidates:
-        if not device:
-            logger.info("camera %s: env var unset, skipping", cam_id)
-            continue
-        if not Path(device).exists():
-            logger.warning("camera %s: %s not present, skipping", cam_id, device)
-            continue
-        specs.append(CameraSpec(cam_id, label, device, width, height, fps, rotate))
-    return specs
-
-
-CAMERA_SPECS: list[CameraSpec] = _build_camera_specs()
+CAMERA_SPECS: list[CameraSpec] = build_camera_specs()
 CAMERA_READERS: dict[str, CameraReader] = {}
 
 
@@ -227,7 +128,7 @@ def _ensure_readers() -> None:
         try:
             CAMERA_READERS[spec.id] = CameraReader(spec)
         except Exception:
-            logger.exception("failed to open camera %s", spec.id)
+            cam_log.exception("failed to open camera %s", spec.id)
 
 
 # ── Codec preference ─────────────────────────────────────────────────────
@@ -341,7 +242,7 @@ async def _handle_webrtc_request(state: ClientState, msg: dict) -> None:
 
     @pc.on("iceconnectionstatechange")
     async def _on_ice_state() -> None:
-        logger.info("ice state: %s", pc.iceConnectionState)
+        rtc_log.info("ice state: %s", pc.iceConnectionState)
         if pc.iceConnectionState in ("failed", "closed"):
             await _close_pc(state)
 
@@ -361,7 +262,7 @@ async def _handle_webrtc_request(state: ClientState, msg: dict) -> None:
 
 async def _handle_webrtc_answer(state: ClientState, msg: dict) -> None:
     if state.pc is None:
-        logger.warning("webrtc_answer with no pending pc")
+        rtc_log.warning("webrtc_answer with no pending pc")
         return
     answer = RTCSessionDescription(sdp=msg["sdp"], type=msg["sdp_type"])
     await state.pc.setRemoteDescription(answer)
@@ -372,7 +273,7 @@ async def _handle_camera_toggle(state: ClientState, msg: dict) -> None:
     enabled = bool(msg.get("enabled", True))
     if state.tracks and cam_id in state.tracks:
         state.tracks[cam_id].enabled = enabled
-        logger.info("camera %s -> %s", cam_id, "on" if enabled else "off")
+        cam_log.info("camera %s -> %s", cam_id, "on" if enabled else "off")
 
 
 async def _close_pc(state: ClientState) -> None:
@@ -394,7 +295,7 @@ async def ws_handler(websocket: WebSocket) -> None:
     state = ClientState(ws=websocket)
     _clients[websocket] = state
     peer = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "?"
-    logger.info("ws connect %s  (now %d clients)", peer, len(_clients))
+    ws_log.info("ws connect %s  (now %d clients)", peer, len(_clients))
 
     # Tell the client which cameras exist before any signaling starts. The
     # UI uses this to render the toggle row even if the operator hasn't
@@ -416,7 +317,7 @@ async def ws_handler(websocket: WebSocket) -> None:
 
             t = msg.get("type", "?")
             if t not in types_seen:
-                logger.info("first %r msg from %s | keys=%s", t, peer, sorted(msg.keys()))
+                ws_log.info("first %r msg from %s | keys=%s", t, peer, sorted(msg.keys()))
             types_seen[t] = types_seen.get(t, 0) + 1
 
             if t in RELAY_TYPES:
@@ -448,7 +349,7 @@ async def ws_handler(websocket: WebSocket) -> None:
                 await websocket.send_json({"echo": msg, "server_time": time.time()})
 
     except WebSocketDisconnect as e:
-        logger.info("ws disconnect %s code=%s totals=%s", peer, e.code, types_seen)
+        ws_log.info("ws disconnect %s code=%s totals=%s", peer, e.code, types_seen)
     finally:
         await _close_pc(state)
         _clients.pop(websocket, None)
