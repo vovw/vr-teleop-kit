@@ -39,12 +39,16 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 import time
+from pathlib import Path
 
+import cv2
 import numpy as np
 
 from vr_teleop_kit.log import get_logger, setup_logging
+from vr_teleop_kit.relay.capture import CameraReader, build_camera_specs
 from vr_teleop_kit.lerobot.bi_quest_teleop import (
     BiQuestTeleoperator,
     BiQuestTeleoperatorConfig,
@@ -93,6 +97,55 @@ def _feature_names(hands: tuple[str, ...]) -> list[str]:
             for n in [f"joint_{j + 1}" for j in range(ARM_DOFS)] + ["gripper"]]
 
 
+# Seconds to wait for a camera's first frame before giving up on it.
+CAMERA_WARMUP_S = 5.0
+
+
+def _open_cameras(enabled: bool, logger) -> tuple[dict[str, CameraReader], dict[str, dict]]:
+    """Open every discovered camera (top / left_wrist / right_wrist).
+
+    Returns ``(readers, features)`` where ``readers`` maps camera id →
+    CameraReader and ``features`` maps the LeRobot feature key
+    (``observation.images.<id>``) → its feature dict. Both empty when
+    disabled or when no camera produces a frame.
+
+    NB: a v4l2 device can only be opened by one process, and the relay
+    lazily grabs the same cameras on the first WebRTC request. So while
+    recording with cameras, do NOT enable the camera stream in the Quest
+    UI, or open() here will fail with "cannot open camera".
+
+    The feature shape is read from the first actual frame so it matches
+    whatever the capture thread emits after any configured rotation.
+    """
+    if not enabled:
+        return {}, {}
+    readers: dict[str, CameraReader] = {}
+    features: dict[str, dict] = {}
+    for spec in build_camera_specs():
+        reader = CameraReader(spec)
+        frame = None
+        deadline = time.time() + CAMERA_WARMUP_S
+        while time.time() < deadline:
+            frame = reader.latest()
+            if frame is not None:
+                break
+            time.sleep(0.05)
+        if frame is None:
+            logger.warning("camera %s produced no frame in %.0fs — skipping",
+                           spec.id, CAMERA_WARMUP_S)
+            reader.stop()
+            continue
+        h, w = frame.shape[:2]
+        readers[spec.id] = reader
+        features[f"observation.images.{spec.id}"] = {
+            "dtype": "video",
+            "shape": (h, w, 3),
+            "names": ["height", "width", "channels"],
+        }
+        logger.info("camera %s recording at %dx%d (%s)", spec.id, w, h, spec.label)
+    return readers, features
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-id", default=None,
@@ -101,6 +154,9 @@ def main() -> None:
     ap.add_argument("--task", default="teleop",
                     help="task string stored with every frame (default: 'teleop')")
     ap.add_argument("--root", default=None, help="local dataset root (default: LeRobot's)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="if the dataset dir already exists, delete it and start fresh "
+                         "(handy for repeated camera checks that reuse a --repo-id)")
     ap.add_argument("--fps", type=int, default=30, help="dataset + control-loop rate")
     ap.add_argument("--num-episodes", type=int, default=0,
                     help="stop after this many saved episodes (0 = until ended from VR)")
@@ -109,6 +165,11 @@ def main() -> None:
     ap.add_argument("--arm", choices=("both", "left", "right"), default="both")
     ap.add_argument("--sim", action="store_true",
                     help="use i2rt sim robots (rehearse the recording flow, no hardware)")
+    ap.add_argument("--no-cameras", action="store_true",
+                    help="skip camera capture (record state/action only). By "
+                         "default every discovered camera is recorded as video. "
+                         "Do not enable the Quest camera stream while recording "
+                         "with cameras — the relay and recorder can't share a v4l2 device.")
     ap.add_argument("--ws-url", default="ws://127.0.0.1:8443/ws", help="relay server WS URL")
     ap.add_argument("--rest-duration-s", type=float, default=3.0)
     ap.add_argument("--rest-steps", type=int, default=90)
@@ -133,9 +194,27 @@ def main() -> None:
             "and install it (pip install -e path/to/i2rt)."
         ) from e
     from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    # LeRobot's create() raises a bare FileExistsError if the dir exists; catch
+    # it here so a reused --repo-id gives an actionable message (or is cleared
+    # with --overwrite) instead of a stack trace.
+    dataset_root = Path(args.root) if args.root else HF_LEROBOT_HOME / args.repo_id
+    if dataset_root.exists():
+        if args.overwrite:
+            logger.warning("--overwrite: removing existing dataset at %s", dataset_root)
+            shutil.rmtree(dataset_root)
+        else:
+            logger.error(
+                "dataset already exists at %s — pass --overwrite to replace it, "
+                "or choose a different --repo-id", dataset_root)
+            sys.exit(1)
 
     hands: tuple[str, ...] = ("left", "right") if args.arm == "both" else (args.arm,)
     channels = {"left": args.left_can, "right": args.right_can}
+
+    cameras, cam_features = _open_cameras(not args.no_cameras, logger)
+    use_videos = bool(cam_features)
 
     names = _feature_names(hands)
     dataset = LeRobotDataset.create(
@@ -143,14 +222,19 @@ def main() -> None:
         fps=args.fps,
         root=args.root,
         robot_type="bi_yam" if args.arm == "both" else "yam",
-        use_videos=False,
+        use_videos=use_videos,
+        # Encode camera frames off the control thread so add_frame() doesn't
+        # stall the fps loop; no-op when there are no cameras.
+        image_writer_threads=4 * len(cameras),
         features={
             "observation.state": {"dtype": "float32", "shape": (len(names),), "names": names},
             "action": {"dtype": "float32", "shape": (len(names),), "names": names},
+            **cam_features,
         },
     )
-    logger.info("dataset %s — LeRobot codebase %s, %d fps, %d-dim state/action, videos=%s",
-                args.repo_id, CODEBASE_VERSION, args.fps, len(names), False)
+    logger.info("dataset %s — LeRobot codebase %s, %d fps, %d-dim state/action, cameras=%s, videos=%s",
+                args.repo_id, CODEBASE_VERSION, args.fps, len(names),
+                list(cameras) or "none", use_videos)
     logger.info("session started %s — writing to %s",
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_start)), dataset.root)
 
@@ -182,6 +266,9 @@ def main() -> None:
     recording = False
     frames_in_episode = 0
     episode_start = 0.0
+    # Last good frame per camera, so a momentary dropped grab reuses the
+    # previous frame rather than leaving a feature missing from add_frame().
+    last_frames: dict[str, np.ndarray] = {cid: r.latest() for cid, r in cameras.items()}
     total_frames = 0
     last_b = last_y = False
     both_held_since: float | None = None
@@ -245,11 +332,22 @@ def main() -> None:
                 teleop.send_feedback({"torques": torques})
 
             if recording:
-                dataset.add_frame({
+                frame = {
                     "observation.state": obs,
                     "action": _action_vector(action, hands),
                     "task": args.task,
-                })
+                }
+                for cid, reader in cameras.items():
+                    img = reader.latest()
+                    if img is None:
+                        img = last_frames.get(cid)
+                    if img is None:
+                        continue
+                    last_frames[cid] = img
+                    # cv2 grabs BGR; LeRobot's image writer treats a 3-channel
+                    # frame as RGB, so convert or red/blue come out swapped.
+                    frame[f"observation.images.{cid}"] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                dataset.add_frame(frame)
                 frames_in_episode += 1
 
             next_tick += period
@@ -292,6 +390,8 @@ def main() -> None:
         try:
             teleop.disconnect()
         finally:
+            for r in cameras.values():
+                r.stop()
             for h in hands:
                 robots[h].close()
 
