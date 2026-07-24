@@ -101,6 +101,34 @@ def _feature_names(hands: tuple[str, ...]) -> list[str]:
 CAMERA_WARMUP_S = 5.0
 
 
+def _discard_open_episode(dataset, logger) -> None:
+    """Drop the in-progress episode buffer *and* its temp PNG frames.
+
+    LeRobot's ``clear_episode_buffer(delete_images=True)`` only deletes dirs
+    for features with ``dtype == "image"`` (``meta.image_keys``). Our cameras
+    are recorded as ``dtype == "video"``, so that set is empty and the raw
+    per-frame PNGs the async image writer dumped to ``images/`` are left on
+    disk — ~2 MB/frame/camera, i.e. gigabytes for one discarded take.
+
+    So we also invoke ``cleanup_interrupted_episode`` (which iterates
+    ``meta.camera_keys`` and covers video features) for the still-open episode
+    index. Both calls are guarded and idempotent, so this stays correct if a
+    future LeRobot fixes the ``clear_episode_buffer`` behavior.
+    """
+    # The open (unsaved) episode takes the next index: saved episodes occupy
+    # 0..num_episodes-1, so the buffer being cleared is num_episodes.
+    ep_index = dataset.num_episodes
+    dataset.clear_episode_buffer()
+    writer = getattr(dataset, "writer", None)
+    cleanup = getattr(writer, "cleanup_interrupted_episode", None)
+    if cleanup is None:
+        return
+    try:
+        cleanup(ep_index)
+    except Exception:
+        logger.debug("cleanup_interrupted_episode(%d) failed", ep_index, exc_info=True)
+
+
 def _open_cameras(enabled: bool, logger) -> tuple[dict[str, CameraReader], dict[str, dict]]:
     """Open every discovered camera (top / left_wrist / right_wrist).
 
@@ -160,8 +188,8 @@ def main() -> None:
     ap.add_argument("--fps", type=int, default=30, help="dataset + control-loop rate")
     ap.add_argument("--num-episodes", type=int, default=0,
                     help="stop after this many saved episodes (0 = until ended from VR)")
-    ap.add_argument("--left-can", default="can1", help="left arm CAN interface (default: can1)")
-    ap.add_argument("--right-can", default="can0", help="right arm CAN interface (default: can0)")
+    ap.add_argument("--left-can", default="can0", help="left arm CAN interface (default: can0)")
+    ap.add_argument("--right-can", default="can1", help="right arm CAN interface (default: can1)")
     ap.add_argument("--arm", choices=("both", "left", "right"), default="both")
     ap.add_argument("--sim", action="store_true",
                     help="use i2rt sim robots (rehearse the recording flow, no hardware)")
@@ -312,7 +340,7 @@ def main() -> None:
                             break
                 if y and not last_y and recording:
                     dur = time.perf_counter() - episode_start
-                    dataset.clear_episode_buffer()
+                    _discard_open_episode(dataset, logger)
                     recording = False
                     logger.info("✗ episode DISCARDED (%d frames, %.1fs) — go again",
                                 frames_in_episode, dur)
@@ -361,7 +389,7 @@ def main() -> None:
         logger.info("interrupted — parking arms at home pose (Ctrl-C again to power off)")
     finally:
         if recording:
-            dataset.clear_episode_buffer()
+            _discard_open_episode(dataset, logger)
             logger.info("open episode discarded (session ended mid-episode)")
         if hasattr(dataset, "finalize"):
             dataset.finalize()

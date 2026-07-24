@@ -104,10 +104,10 @@ def ramp_to_rest(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--left-can", default="can1",
-                    help="left arm CAN interface (default: can1)")
-    ap.add_argument("--right-can", default="can0",
-                    help="right arm CAN interface (default: can0)")
+    ap.add_argument("--left-can", default="can0",
+                    help="left arm CAN interface (default: can0)")
+    ap.add_argument("--right-can", default="can1",
+                    help="right arm CAN interface (default: can1)")
     ap.add_argument("--ws-url", default="ws://127.0.0.1:8443/ws", help="relay server WS URL")
     ap.add_argument("--freq", type=int, default=200, help="teleop loop rate (Hz)")
     ap.add_argument("--rest-duration-s", type=float, default=3.0,
