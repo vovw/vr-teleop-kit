@@ -20,9 +20,13 @@ Highlights:
 
 - **Clutch-relative mapping**: hold the grip button and the robot follows
   your hand's relative motion; release, reposition, grab again.
-- **Controller buttons**: grip = clutch; a precision modifier (hold to
-  lower the gains for fine work); and a button that sends the arm back to
-  its home pose.
+- **Controller buttons**: grip = clutch, trigger = gripper, a precision
+  modifier (hold to lower the gains for fine work), a button that sends
+  the arm back to its home pose, and episode start/save while recording —
+  see the [controller reference](#quest-controller-reference).
+- **Dataset recording**: `examples/record_bi_yam.py` writes LeRobot v3.0
+  datasets (parquet + mp4) straight from VR, one or both arms, with an
+  optional push to the Hugging Face Hub.
 - **Reach limit**: the target pose can never run more than a fixed
   distance or angle ahead of the robot. Pressing past a joint limit or the
   workspace boundary feels like a wall (with haptic feedback), and
@@ -161,6 +165,29 @@ place: the hand rotates, the wrist pivot stays still), then
 **Start Teleop**. Settings (gains, smoothing, velocity caps, haptics)
 are on the same page and apply live.
 
+## Quest controller reference
+
+Everything is driven from the controllers; no keyboard is needed during a
+session. The first four bindings are per-arm — the left controller drives
+the left arm, the right the right.
+
+| Control | Action | What it does |
+| --- | --- | --- |
+| **Grip** (squeeze) | hold | Clutch. That arm follows your hand's *relative* motion. Release to freeze the arm and reposition your hand, squeeze again to re-anchor. |
+| **Trigger** | analog | Gripper closure, `0.0` open → `1.0` closed. Only tracked while grip is held, so the gripper won't drift between corrections. |
+| **A** (right) / **X** (left) | hold | Precision scale. Multiplies that arm's translation *and* rotation gains by `precision_factor` (default `0.5`) for fine positioning. Re-anchors on press and release, so there's no snap. |
+| **Thumbstick click** | press | Send that arm to its home/rest pose, ramped over ~2 s. Handy between episodes. |
+| **B** (right) | press | **Recording only**: start an episode when idle; discard the take and restart it immediately when already recording. |
+| **Y** (left) | press | **Recording only**: save the episode in progress. |
+
+Outside the recorder, **B** and **Y** are generic handoff signals
+(`is_pause_pressed` / `is_reverse_pressed`) for an orchestrator to poll —
+see "Use as a LeRobot Teleoperator" below.
+
+Note the asymmetry when recording single-arm: start/save live on
+*different* controllers, so you need both in hand even for a `--arm right`
+session.
+
 ## Cameras
 
 The relay auto-discovers RealSense color streams at startup — no
@@ -197,6 +224,112 @@ and asserts on the resulting actions (no headset needed).
 so they need the `[lerobot]` extra — installed by the Install command
 above, not just the bare package.)
 
+`tools/viewer_client.py` renders one arm per window (`--arm left|right`);
+`tools/viewer_both.py` puts both arms in a single scene, which is easier
+to watch during a bimanual session.
+
+## Drive the arms
+
+Two terminals: the relay, then the teleop loop.
+
+```bash
+vr-teleop-relay                          # terminal 1
+adb reverse tcp:8443 tcp:8443            # USB only
+
+python examples/teleop_bi_yam.py         # terminal 2 — both arms
+python examples/teleop_bi_yam.py --arm right     # right arm only
+```
+
+| Argument | Default | Notes |
+| --- | --- | --- |
+| `--arm both\|left\|right` | `both` | Single-arm still tracks both controllers; only the chosen arm is connected and driven. |
+| `--right-can` | `can0` | Right arm's CAN interface. |
+| `--left-can` | `can1` | Left arm's CAN interface. |
+| `--freq` | `200` | Control loop rate (Hz). |
+| `--rest-duration-s` / `--rest-steps` | `3.0` / `90` | Startup ramp to the rest pose. |
+| `--ws-url` | `ws://127.0.0.1:8443/ws` | Use `wss://` if the relay serves TLS. |
+
+The arms ramp to their rest pose on startup and again on exit. Rest pose
+defaults to all-zero joints; override per arm with seven comma-separated
+values (joints 1–6 + gripper — the gripper value is dropped, since the
+trigger drives it):
+
+```bash
+export RIGHT_REST_POSE="0,0.3,-0.5,0,0.2,0,1"
+export LEFT_REST_POSE="0,0.3,-0.5,0,0.2,0,1"
+```
+
+IK gains are also exposed as flags (`--scale-translation`,
+`--scale-rotation`, `--pose-filter-alpha`, damping/reach limits) for a
+permanent default; the web Settings panel tunes the same values live.
+
+## Record a dataset
+
+`examples/record_bi_yam.py` writes a LeRobot v3.0 dataset — `data/` as
+parquet, each camera as an mp4 — driven entirely from the controllers.
+Needs the `[lerobot]` extra.
+
+```bash
+vr-teleop-relay                          # terminal 1
+adb reverse tcp:8443 tcp:8443            # USB only
+
+# terminal 2 — bimanual, all 3 cameras, 20 episodes, upload when done
+python examples/record_bi_yam.py \
+    --repo-id <hf-user>/yam-towel-fold \
+    --task "use one arm to anchor the towel and fold it with the other" \
+    --num-episodes 20 --push-to-hub
+```
+
+Right arm only, which also drops the left wrist camera:
+
+```bash
+python examples/record_bi_yam.py --arm right \
+    --repo-id <hf-user>/yam-pick-cube --task "pick up the cube" \
+    --num-episodes 20 --push-to-hub
+```
+
+Rehearse the whole flow with no motors and no hardware:
+
+```bash
+python examples/record_bi_yam.py --sim --repo-id local/rehearsal --overwrite
+```
+
+Then, in VR: **right B** to start, do the task, **left Y** to save.
+Repeat. The session ends itself after `--num-episodes` saves.
+
+| Argument | Default | Notes |
+| --- | --- | --- |
+| `--arm both\|left\|right` | `both` | Selects arms **and** cameras: `both` → 14-dim `left_*`/`right_*` + all 3 cameras; `right` → 7-dim `right_*` + top and right-wrist only. |
+| `--num-episodes` | `0` | End the session after this many *saved* episodes. `0` = run until Ctrl-C. |
+| `--repo-id` | `atharva/yam-teleop-<stamp>` | Dataset id. **Set this** — the owner must match your `hf auth login` account or `--push-to-hub` fails with 403. |
+| `--task` | `"teleop"` | Language instruction stored on every frame. Set it; relabelling afterwards means rewriting the dataset. |
+| `--push-to-hub` | off | Upload when the session ends, after the arms power down. **Public** unless `--private`. |
+| `--private` | off | Make the pushed repo private. |
+| `--fps` | `30` | Dataset and control-loop rate. |
+| `--no-cameras` | off | Record state/action only. |
+| `--sim` | off | i2rt MuJoCo sim robots — rehearse with no hardware. |
+| `--overwrite` | off | Delete an existing dataset dir instead of erroring. |
+| `--root` | LeRobot's | Local dataset root. |
+| `--left-can` / `--right-can` | `can1` / `can0` | Per-arm CAN interface. |
+
+Which cameras get recorded is decided by discovery (see "Cameras" above)
+intersected with `--arm`: the `top` camera is always kept, and a wrist
+camera only when its arm is in use. Pin devices explicitly with
+`CAM_TOP` / `CAM_LEFT` / `CAM_RIGHT` if discovery picks wrong.
+
+Two things that will cost you data:
+
+- **Don't enable the Quest camera stream while recording.** A v4l2 device
+  opens once; the relay would grab the same RealSense and the recorder's
+  `open()` fails with "cannot open camera".
+- **Ctrl-C during an open episode discards it.** Press **left Y** to save
+  first. The first Ctrl-C parks the arms and holds them there; a second
+  powers them off.
+
+The dataset is finalized on disk before the arms are parked, so it's
+complete and loadable even if you interrupt the shutdown. A failed
+`--push-to-hub` is logged and the local copy kept for a manual retry.
+
 ## Use as a LeRobot Teleoperator
 
 The adapter emits a bimanual joint action dict
@@ -222,8 +355,9 @@ while True:
     time.sleep(1 / 200)
 ```
 
-`examples/teleop_bi_yam.py` is the complete hardware version of this
-loop: it drives two i2rt YAMs (one CAN channel per arm) directly via
+`examples/teleop_bi_yam.py` (see "Drive the arms" above) is the complete
+hardware version of this loop: it drives two i2rt YAMs (one CAN channel
+per arm) directly via
 `get_yam_robot`, with the rest ramp, gripper-convention conversion
 (i2rt's normalized gripper is 0 = closed, 1 = open — the inverse of the
 teleop's), haptic feedback, and timing. For LeRobot CLIs, import

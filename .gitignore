@@ -14,8 +14,12 @@ cams.env
 logs/
 *.log
 
-# MuJoCo writes this GLFW/render log next to the CWD; site-local noise.
+# MuJoCo writes these next to the CWD: the GLFW/render log, and the model
+# and data dumps some viewers emit on load. All site-local noise.
 MUJOCO_LOG.TXT
+MJMODEL.TXT
+MJDATA.TXT
+*.mjb
 
 __pycache__/
 *.py[cod]
