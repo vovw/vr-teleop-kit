@@ -6,14 +6,17 @@ In-VR control map (on top of the normal teleop bindings):
     grip (squeeze)     drive the arm (clutch), trigger = gripper
     A / X (hold)       precision scale
     thumbstick click   ramp that arm to its rest pose (nice between episodes)
-    right B            start episode  /  save episode (toggle)
-    left Y             discard the episode being recorded (re-do it)
-    right B + left Y   hold both ~1.5 s while idle → end the session
+    right B (idle)     start an episode
+    right B (recording) throw the take away and restart it immediately
+    left Y             save the episode being recorded
+
+The session ends by itself after `--num-episodes` saved episodes (or on
+Ctrl-C, which parks the arms first). There is no button chord.
 
 Teleop keeps driving the robot between episodes (so you can reset the
 scene with the arm), but frames are only written while an episode is
 open. Episode transitions are logged loudly; watch the terminal or trust
-the muscle memory: B ... do the thing ... B.
+the muscle memory: B ... do the thing ... Y.
 
 The loop runs at the dataset fps (default 30), like `lerobot-record`.
 The per-joint velocity caps are per-tick, so at 30 fps the arm is slower
@@ -24,10 +27,17 @@ Requires lerobot (this is the one entry point that genuinely needs it —
 on a weak connection install CPU-only torch first:
 `pip install torch --index-url https://download.pytorch.org/whl/cpu`).
 
+Frames land in LeRobot v3.0 layout: `data/` as parquet, cameras as mp4.
+With `--push-to-hub` the finished dataset is uploaded to the Hugging Face
+Hub once the arms are powered down — public by default, `--private` to
+opt out. The `--repo-id` owner must be the account you are logged into
+(`hf auth login`), or the upload 403s.
+
 Run (hardware):
     python examples/record_bi_yam.py \\
         --repo-id you/yam-task --task "fold the towel" \\
-        --left-can can_left --right-can can_right
+        --left-can can_left --right-can can_right \\
+        --num-episodes 20 --push-to-hub
 
 Rehearse the whole flow without motors (i2rt sim robots):
     python examples/record_bi_yam.py \\
@@ -62,9 +72,6 @@ from vr_teleop_kit.lerobot.cli import (
 # Shares the robot-facing helpers with the plain teleop example.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from teleop_bi_yam import ARM_DOFS, _command_arm, _gripper_feedback, ramp_to_rest  # noqa: E402
-
-# Hold right-B + left-Y this long (while idle) to end the session.
-END_SESSION_HOLD_S = 1.5
 
 # Owner prefix used when --repo-id is omitted. The full default id gets a
 # wall-clock stamp appended (yam-teleop-<YYYYmmdd-HHMMSS>) so back-to-back
@@ -129,8 +136,58 @@ def _discard_open_episode(dataset, logger) -> None:
         logger.debug("cleanup_interrupted_episode(%d) failed", ep_index, exc_info=True)
 
 
-def _open_cameras(enabled: bool, logger) -> tuple[dict[str, CameraReader], dict[str, dict]]:
-    """Open every discovered camera (top / left_wrist / right_wrist).
+def _push_to_hub(dataset, repo_id: str, private: bool, logger) -> None:
+    """Upload the finished dataset to the Hugging Face Hub.
+
+    Best-effort by design: the dataset is already complete on disk before
+    this runs, so a failed upload must not mask the session result. It is
+    logged and the local copy left untouched for a manual retry.
+
+    Called after the arms are powered down — a few-hundred-MB video upload
+    takes minutes, and there is no reason to hold the motors energized for
+    it.
+    """
+    if dataset.num_episodes == 0:
+        logger.info("no episodes saved — nothing to push")
+        return
+
+    # A repo id whose owner isn't the logged-in user 403s after uploading
+    # nothing useful; warn up front rather than after the wait. This is easy
+    # to hit because an omitted --repo-id defaults to DEFAULT_REPO_OWNER.
+    owner = repo_id.split("/")[0] if "/" in repo_id else None
+    try:
+        from huggingface_hub import whoami
+
+        user = whoami().get("name")
+    except Exception:  # not logged in, offline, or hub API changed
+        user = None
+    if user and owner and owner != user:
+        logger.warning(
+            "--repo-id owner %r is not the logged-in HF user %r — this push will "
+            "likely fail with 403. Use --repo-id %s/<name> next time.",
+            owner, user, user,
+        )
+
+    logger.info("pushing %d episode(s) to https://huggingface.co/datasets/%s (%s)",
+                dataset.num_episodes, repo_id, "private" if private else "public")
+    try:
+        dataset.push_to_hub(private=private, tags=["robotics", "lerobot", "yam", "teleop"])
+    except Exception:
+        logger.exception("push failed — dataset kept at %s (retry by hand)", dataset.root)
+    else:
+        logger.info("push complete: https://huggingface.co/datasets/%s", repo_id)
+
+
+def _open_cameras(
+    enabled: bool, hands: tuple[str, ...], logger
+) -> tuple[dict[str, CameraReader], dict[str, dict]]:
+    """Open the discovered cameras relevant to ``hands``.
+
+    The overhead ``top`` camera is always kept; a wrist camera is kept only
+    when its arm is actually being recorded. Without this filter a
+    ``--arm right`` run still records ``left_wrist`` — a second video stream
+    of an arm that never moves, roughly doubling the dataset size for
+    nothing.
 
     Returns ``(readers, features)`` where ``readers`` maps camera id →
     CameraReader and ``features`` maps the LeRobot feature key
@@ -147,9 +204,14 @@ def _open_cameras(enabled: bool, logger) -> tuple[dict[str, CameraReader], dict[
     """
     if not enabled:
         return {}, {}
+    wanted = {"top", *(f"{hand}_wrist" for hand in hands)}
     readers: dict[str, CameraReader] = {}
     features: dict[str, dict] = {}
     for spec in build_camera_specs():
+        if spec.id not in wanted:
+            logger.info("camera %s skipped — %s arm not in --arm %s",
+                        spec.id, spec.id.removesuffix("_wrist"), "/".join(hands))
+            continue
         reader = CameraReader(spec)
         frame = None
         deadline = time.time() + CAMERA_WARMUP_S
@@ -187,9 +249,10 @@ def main() -> None:
                          "(handy for repeated camera checks that reuse a --repo-id)")
     ap.add_argument("--fps", type=int, default=30, help="dataset + control-loop rate")
     ap.add_argument("--num-episodes", type=int, default=0,
-                    help="stop after this many saved episodes (0 = until ended from VR)")
-    ap.add_argument("--left-can", default="can0", help="left arm CAN interface (default: can0)")
-    ap.add_argument("--right-can", default="can1", help="right arm CAN interface (default: can1)")
+                    help="end the session after this many saved episodes "
+                         "(0 = keep going until Ctrl-C)")
+    ap.add_argument("--left-can", default="can1", help="left arm CAN interface (default: can1)")
+    ap.add_argument("--right-can", default="can0", help="right arm CAN interface (default: can0)")
     ap.add_argument("--arm", choices=("both", "left", "right"), default="both")
     ap.add_argument("--sim", action="store_true",
                     help="use i2rt sim robots (rehearse the recording flow, no hardware)")
@@ -198,6 +261,13 @@ def main() -> None:
                          "default every discovered camera is recorded as video. "
                          "Do not enable the Quest camera stream while recording "
                          "with cameras — the relay and recorder can't share a v4l2 device.")
+    ap.add_argument("--push-to-hub", action="store_true",
+                    help="upload the dataset to the Hugging Face Hub when the "
+                         "session ends (after the arms are powered down). "
+                         "Public unless --private is also passed.")
+    ap.add_argument("--private", action="store_true",
+                    help="with --push-to-hub, create the Hub repo private "
+                         "(default: public)")
     ap.add_argument("--ws-url", default="ws://127.0.0.1:8443/ws", help="relay server WS URL")
     ap.add_argument("--rest-duration-s", type=float, default=3.0)
     ap.add_argument("--rest-steps", type=int, default=90)
@@ -241,7 +311,7 @@ def main() -> None:
     hands: tuple[str, ...] = ("left", "right") if args.arm == "both" else (args.arm,)
     channels = {"left": args.left_can, "right": args.right_can}
 
-    cameras, cam_features = _open_cameras(not args.no_cameras, logger)
+    cameras, cam_features = _open_cameras(not args.no_cameras, hands, logger)
     use_videos = bool(cam_features)
 
     names = _feature_names(hands)
@@ -286,9 +356,11 @@ def main() -> None:
 
     logger.info("──────────────────────────────────────────────────")
     logger.info("VR recording controls:")
-    logger.info("  right B        start / save episode")
-    logger.info("  left Y         discard current episode")
-    logger.info("  B + Y (hold)   end session (while idle)")
+    logger.info("  right B        start episode (idle) / discard + restart it (recording)")
+    logger.info("  left Y         save episode")
+    logger.info("  end of session %s",
+                f"after {args.num_episodes} saved episode(s)"
+                if args.num_episodes else "on Ctrl-C (no --num-episodes given)")
     logger.info("──────────────────────────────────────────────────")
 
     recording = False
@@ -299,7 +371,6 @@ def main() -> None:
     last_frames: dict[str, np.ndarray] = {cid: r.latest() for cid, r in cameras.items()}
     total_frames = 0
     last_b = last_y = False
-    both_held_since: float | None = None
     period = 1.0 / args.fps
     interrupted = False
 
@@ -309,41 +380,37 @@ def main() -> None:
             b = teleop.is_pause_pressed()     # right B (level)
             y = teleop.is_reverse_pressed()   # left Y (level)
 
-            # End-session chord: both held while idle.
-            if not recording and b and y:
-                both_held_since = both_held_since or time.perf_counter()
-                if time.perf_counter() - both_held_since >= END_SESSION_HOLD_S:
-                    logger.info("B+Y held — ending session")
-                    break
-            else:
-                both_held_since = None
-
-            # Suppress single-button edges while the chord is being formed.
-            chording = b and y
-            if not chording:
-                if b and not last_b:
-                    if not recording:
-                        recording, frames_in_episode = True, 0
-                        episode_start = time.perf_counter()
-                        logger.info("● episode %d STARTED at %s",
-                                    dataset.num_episodes, time.strftime("%H:%M:%S"))
-                    elif frames_in_episode > 0:
-                        dur = time.perf_counter() - episode_start
-                        total_frames += frames_in_episode
-                        dataset.save_episode()
-                        recording = False
-                        logger.info("✓ episode %d SAVED (%d frames, %.1fs, %.1f fps) — %d frames total",
-                                    dataset.num_episodes - 1, frames_in_episode, dur,
-                                    frames_in_episode / dur if dur > 0 else 0.0, total_frames)
-                        if args.num_episodes and dataset.num_episodes >= args.num_episodes:
-                            logger.info("reached --num-episodes=%d", args.num_episodes)
-                            break
-                if y and not last_y and recording:
+            # Right B: start when idle, discard-and-restart when recording. The
+            # restart is immediate (recording stays True) so a botched take is
+            # re-done with one press instead of stop-then-start.
+            if b and not last_b:
+                if recording:
                     dur = time.perf_counter() - episode_start
                     _discard_open_episode(dataset, logger)
-                    recording = False
-                    logger.info("✗ episode DISCARDED (%d frames, %.1fs) — go again",
+                    logger.info("✗ episode DISCARDED (%d frames, %.1fs) — restarting now",
                                 frames_in_episode, dur)
+                recording, frames_in_episode = True, 0
+                episode_start = time.perf_counter()
+                logger.info("● episode %d STARTED at %s",
+                            dataset.num_episodes, time.strftime("%H:%M:%S"))
+
+            # Left Y: save. An empty buffer can't be saved (LeRobot raises), so
+            # a Y before any frame landed is ignored and the episode stays open.
+            if y and not last_y and recording:
+                if frames_in_episode == 0:
+                    logger.warning("Y pressed with 0 frames recorded — still recording")
+                else:
+                    dur = time.perf_counter() - episode_start
+                    total_frames += frames_in_episode
+                    dataset.save_episode()
+                    recording = False
+                    logger.info("✓ episode %d SAVED (%d frames, %.1fs, %.1f fps) — %d frames total",
+                                dataset.num_episodes - 1, frames_in_episode, dur,
+                                frames_in_episode / dur if dur > 0 else 0.0, total_frames)
+                    if args.num_episodes and dataset.num_episodes >= args.num_episodes:
+                        logger.info("reached --num-episodes=%d — ending session",
+                                    args.num_episodes)
+                        break
             last_b, last_y = b, y
 
             # lerobot-record ordering: observe, act, command, write.
@@ -422,6 +489,10 @@ def main() -> None:
                 r.stop()
             for h in hands:
                 robots[h].close()
+
+        # Last, with the motors off: the upload can take minutes.
+        if args.push_to_hub:
+            _push_to_hub(dataset, args.repo_id, args.private, logger)
 
 
 if __name__ == "__main__":
