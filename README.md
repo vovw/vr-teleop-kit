@@ -220,6 +220,20 @@ python examples/pure_sim.py           # terminal 3: IK loop, no hardware
 `tools/smoke_test.py` drives the full pipeline with a fake Quest client
 and asserts on the resulting actions (no headset needed).
 
+`tools/sim_check_ee_recorder.py` does the same for the end-effector
+recorder below. `--self-test` runs the pure checks (rotation encodings,
+feature schema) with nothing else running; without it, the tool acts as a
+fake Quest against a live relay and a `--sim` recorder — pressing B,
+moving under the clutch, pressing Y — then verifies the saved dataset:
+
+```bash
+vr-teleop-relay                                     # terminal 1
+python examples/record_bi_ee_only.py --sim --no-cameras --with-joints \
+    --num-episodes 1 --repo-id local/ee-sim-check \
+    --root /tmp/ee-sim-check --overwrite            # terminal 2
+python tools/sim_check_ee_recorder.py --root /tmp/ee-sim-check   # terminal 3
+```
+
 (`pure_sim.py` and `smoke_test.py` use the LeRobot Teleoperator adapter,
 so they need the `[lerobot]` extra — installed by the Install command
 above, not just the bare package.)
@@ -329,6 +343,107 @@ Two things that will cost you data:
 The dataset is finalized on disk before the arms are parked, so it's
 complete and loadable even if you interrupt the shutdown. A failed
 `--push-to-hub` is logged and the local copy kept for a manual retry.
+
+### End-effector-pose datasets
+
+`examples/record_bi_ee_only.py` records the same sessions in Cartesian
+space instead of joint space — same VR controls, same cameras, same
+flags, plus `--rotation` and `--with-joints`:
+
+```bash
+python examples/record_bi_ee_only.py \
+    --repo-id <hf-user>/yam-ee-towel --task "fold the towel" \
+    --num-episodes 20 --push-to-hub
+```
+
+Per arm, `observation.state` is the FK of the *measured* joints and
+`action` the FK of the *commanded* ones:
+`[ee_pos(3), ee_rot6d(6), gripper(1)]` — 20-dim bimanual, 10 single-arm
+(`--rotation quat` writes xyzw instead, 16/8-dim). The pose is the
+`tool0` site between the fingertips, the gripper keeps the teleop's
+0 = open convention, and `rot6d` is the first two rows of the rotation
+matrix (the pytorch3d / diffusion-policy convention). The robot is still
+driven in joint space — only the recorded features change.
+
+Two caveats. Each arm's pose is in **its own base frame** (the IK builds
+one model per arm); the base-to-base transform isn't modelled here, so a
+bimanual dataset holds two independent frames. And deploying an
+EE-action policy needs a follower this repo doesn't have yet: a loop
+holding the latest Cartesian target and stepping
+`DecoupledIKSolver.solve()` toward it well above the policy rate, seeded
+from the measured joints. `--with-joints` additionally stores
+`measured_joints` / `commanded_joints` for replay and offline
+re-derivation; LeRobot's policy-feature mapping ignores those keys, so
+the learned spaces stay EE-only.
+
+### Single-arm demos in the bspline/tidybot2 format
+
+`examples/record_yam_bspline_format.py` drives one arm and writes episodes in
+the layout `bspline-policy/real_env/yam_teleop/episode_storage.py` produces —
+`<stamp>/wrist_image.mp4` + `data.pkl` — instead of a LeRobot dataset:
+
+```bash
+python examples/record_yam_bspline_format.py --arm right --right-can can0 --num-episodes 1
+```
+
+Per step it stores their single-YAM schema: obs `{arm_pos (3), arm_quat (4,
+xyzw w>=0), gripper_pos (1), wrist_image (480x640x3 RGB)}` and the same keys
+minus the image as the action, at 10 Hz (`--freq`). Their `EpisodeReader`,
+`reviewer.py` and `convert_to_robomimic_hdf5.py` consume it unchanged, landing
+on their `single_yam_rot6d` schema (10-dim action: pos 3 + rot6d 6 + gripper 1).
+
+`arm_pos`/`arm_quat` use *their* TCP convention — the link6 flange re-axed by
+`_T_LINK6_TO_TCP` — but computed from this repo's MuJoCo model, which disagrees
+with their pyroki/URDF chain by up to ~9 mm at the same joint angles. Data
+collected and deployed entirely within this repo is self-consistent (a policy
+never sees an IK solver); do not mix these episodes with ones recorded by their
+`yam_server`.
+
+## Deploying an EE-pose policy
+
+`vr_teleop_kit.ik.EEFollower` is the deployment-side counterpart to the teleop
+loop: it holds the latest Cartesian target and steps `DecoupledIKSolver`
+toward it at a fixed rate well above the policy's, so a 10 Hz policy output
+doesn't arrive as one clipped IK step.
+
+```python
+from vr_teleop_kit.ik.decoupled_ik import DecoupledIKSolver
+from vr_teleop_kit.ik.ee_follower import EEFollower
+
+solver = DecoupledIKSolver(mu=0.0)          # see posture bias below
+follower = EEFollower(solver, send_joints=my_driver, freq=200.0,
+                      target_frame="tcp",   # "tool0" for this repo's EE datasets
+                      q_init=robot.get_joint_pos()[:6])
+follower.start()
+follower.set_target(pos, quat_xyzw, gripper)   # call at the policy's rate
+```
+
+Three things it handles, each of which is a real failure mode measured in
+`tools/sim_check_ee_follower.py`:
+
+- **Posture bias.** The solver's Tikhonov term leaves a *steady-state* offset
+  against a fixed target: 3.4 mm at the teleop default `mu=0.02`, 0.22 mm at
+  `0.005`, exact at `0.0`. Invisible under teleop (the operator corrects it),
+  but a policy has no such loop — build the rollout solver with a low `mu`.
+- **Target frame.** A policy trained on bspline/tidybot2 data emits poses in
+  their flange convention, 13.47 cm behind `tool0`. `target_frame="tcp"`
+  applies the conversion, read off the model rather than hardcoded.
+- **Reach clamp.** Targets are bounded to `pos_reach_limit` / `rot_reach_limit`
+  of the arm's current pose each tick — the same guard `ClutchPoseMapper`
+  applies under teleop. Without it an out-of-workspace command stretches the
+  arm to full extension, where it can pin joints 2/3 against their limits with
+  the wrist at exactly ±π/2. That state is a genuine deadlock of the decoupled
+  solver: it does not recover.
+
+Verify with no hardware and no relay:
+
+```bash
+python tools/sim_check_ee_follower.py --root /tmp/ee-sim-check
+```
+
+Check 2 is the meaningful one — it replays a recorded episode's EE actions
+through the follower and compares against the `commanded_joints` that produced
+them, so the correct answer is known exactly.
 
 ## Use as a LeRobot Teleoperator
 
