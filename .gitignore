@@ -31,3 +31,19 @@ build/
 
 # Recorded episodes (bspline/tidybot2 format recorder)
 data/
+
+# Generated MuJoCo scene: build_scene.py bakes absolute mesh paths for this
+# checkout into it, so it is rebuilt per machine rather than committed.
+#   python sim/build_scene.py --table-color neutral --arm-style translucent
+sim/spd_scene.xml
+
+# Debug renders, comparison sheets and fit overlays from the sim tooling, plus
+# the cached ideal->distorted remap. All regenerable from the committed
+# intrinsics/pose JSON; the one side-by-side the README cites as evidence for
+# the joint mapping is kept.
+sim/*.png
+sim/top_distortion_map.npz
+sim/compare/
+sim/wrist_fit/
+sim/compare_arms/*
+!sim/compare_arms/pose04_side_by_side.png

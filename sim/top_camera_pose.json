@@ -1,0 +1,30 @@
+{
+  "pos": [
+    0.015795433631640717,
+    -0.5613810906963058,
+    0.9256420825942144
+  ],
+  "euler_deg": [
+    34.317796102513725,
+    1.1243236080887156,
+    -3.2772266967525403
+  ],
+  "fitted": true,
+  "fit_rms_px": 0.4085201567822008,
+  "free_height": true,
+  "source_image": "greenscreen/top.png",
+  "features": {
+    "far": 351,
+    "left": 227,
+    "right": 158,
+    "seam": 310
+  },
+  "fit_features": [
+    "far",
+    "left",
+    "seam"
+  ],
+  "held_out_features": [
+    "right"
+  ]
+}

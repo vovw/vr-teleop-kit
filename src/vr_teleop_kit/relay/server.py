@@ -48,6 +48,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from vr_teleop_kit.relay.capture import CameraReader, CameraSpec, build_camera_specs
+from vr_teleop_kit.relay.sim_frames import (
+    SimBusHolder,
+    SimFrameReader,
+    build_sim_camera_specs,
+    sim_frames_enabled,
+)
 from vr_teleop_kit.log import get_logger, setup_logging
 
 setup_logging(level=logging.INFO)
@@ -115,13 +121,38 @@ class CameraTrack(VideoStreamTrack):
 # message on WS open), so missing cameras silently disappear instead of
 # erroring at peer-connect time.
 
-CAMERA_SPECS: list[CameraSpec] = build_camera_specs()
-CAMERA_READERS: dict[str, CameraReader] = {}
+# With VR_TELEOP_SIM_FRAMES set, the frames come from a simulator over shared
+# memory instead of v4l2 (see relay/sim_frames.py). Camera ids are identical
+# either way, so the Quest UI, the camera_list message and dataset keys do not
+# change. Opt-in by design: unset, this file behaves exactly as before.
+SIM_FRAMES: bool = sim_frames_enabled()
+CAMERA_SPECS: list[CameraSpec] = (
+    build_sim_camera_specs() if SIM_FRAMES else build_camera_specs())
+CAMERA_READERS: dict[str, CameraReader | SimFrameReader] = {}
+# A holder, not a bus: the simulator clears any stale block when it starts, so a
+# cached bus ends up mapping an orphaned "(deleted)" block and serving black
+# frames forever. The holder re-attaches when that happens, which makes
+# restarting the simulator while the relay keeps running work.
+SIM_BUS: SimBusHolder | None = None
+
+if SIM_FRAMES:
+    cam_log.info("VR_TELEOP_SIM_FRAMES set — serving simulated cameras %s",
+                 [s.id for s in CAMERA_SPECS])
 
 
 def _ensure_readers() -> None:
     """Lazy-open the cameras on first WebRTC request. Avoids holding v4l2
     locks during dev iterations where the operator only wants the relay."""
+    global SIM_BUS
+    if SIM_FRAMES:
+        if SIM_BUS is None:
+            SIM_BUS = SimBusHolder()
+        if SIM_BUS.bus() is None:
+            cam_log.warning("sim frame bus not found — start the sim process "
+                            "first; readers will attach once it does")
+        for spec in CAMERA_SPECS:
+            CAMERA_READERS.setdefault(spec.id, SimFrameReader(SIM_BUS, spec))
+        return
     for spec in CAMERA_SPECS:
         if spec.id in CAMERA_READERS:
             continue
@@ -178,6 +209,8 @@ async def lifespan(app: FastAPI):
     yield
     for reader in CAMERA_READERS.values():
         reader.stop()
+    if SIM_BUS is not None:
+        SIM_BUS.close()
 
 
 app = FastAPI(lifespan=lifespan)
